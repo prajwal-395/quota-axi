@@ -1,6 +1,14 @@
 import { homedir } from "node:os";
 import { join } from "node:path";
-import { readJsonFileResult, type JsonFileReadResult } from "../lib/fs.js";
+import {
+  readJsonFile,
+  readJsonFileResult,
+  type JsonFileReadResult,
+} from "../lib/fs.js";
+import { execFileText } from "../lib/process.js";
+import { providerFetch, readBoundedResponseBody } from "../lib/http.js";
+import { traceInput } from "../lib/input-trace.js";
+import { userConfigFilePath } from "../lib/user-config.js";
 import { resolvePiAuthFilePath } from "../lib/pi-agent-dir.js";
 import { classifyPiAuthEntry } from "../lib/pi-auth-store.js";
 import {
@@ -13,6 +21,7 @@ import type {
   AuthProviderReport,
   AuthSourceReport,
   ProviderAdapter,
+  ProviderAccount,
   ProviderQuota,
   ProviderStatus,
   QuotaWindow,
@@ -47,6 +56,8 @@ const DEADLINE_MS = 15_000;
 const FIVE_HOURS_SECONDS = 18_000;
 /** Plan-declared weekly cap: $30 per week. */
 const WEEK_SECONDS = 7 * 24 * 60 * 60;
+const OPENCODE_GO_STATUS_URL = "https://opencode.ai/console/api/go/status";
+const SQLITE_TIMEOUT_MS = 5_000;
 
 export type CredentialResolution =
   | { status: "available"; key: string; path: string }
@@ -69,9 +80,13 @@ export type NamedOpenCodeGoCredentialSource = {
 type Dependencies = {
   credentialSources: NamedOpenCodeGoCredentialSource[];
   fetch: typeof globalThis.fetch;
+  workspaceFetch: typeof globalThis.fetch;
   now: () => number;
   deadlineMs: number;
 };
+
+type WorkspaceConfig = { label: string; path: string };
+type WorkspaceCredential = { accessToken: string; orgId: string };
 
 export type NormalizedOpenCodeGoPayload = {
   plan?: string;
@@ -206,6 +221,7 @@ export function createOpenCodeGoAdapter(
   const dependencies: Dependencies = {
     credentialSources: defaultOpenCodeGoCredentialSources(),
     fetch: globalThis.fetch,
+    workspaceFetch: providerFetch,
     now: Date.now,
     deadlineMs: DEADLINE_MS,
     ...overrides,
@@ -215,10 +231,223 @@ export function createOpenCodeGoAdapter(
     label: LABEL,
     fetchQuota: () => fetchQuota(dependencies),
     inspectAuth: () => inspectAuth(dependencies),
+    discoverAccounts: () => discoverWorkspaceAccounts(dependencies),
   };
 }
 
 export const opencodeGoAdapter = createOpenCodeGoAdapter();
+
+async function discoverWorkspaceAccounts(
+  dependencies: Dependencies,
+): Promise<ProviderAccount[] | undefined> {
+  const configured = readWorkspaceConfig();
+  if (!configured) return undefined;
+  const keys = new Set<string>();
+  return configured.map((workspace) => {
+    const baseKey = workspaceAccountKey(workspace.label);
+    let accountKey = baseKey;
+    let suffix = 2;
+    while (keys.has(accountKey)) accountKey = `${baseKey}-${suffix++}`;
+    keys.add(accountKey);
+    const label = `${LABEL} · ${workspace.label}`;
+    return {
+      accountKey,
+      fetchQuota: async () =>
+        fetchWorkspaceQuota(workspace, label, dependencies),
+      inspectAuth: async () => inspectWorkspaceAuth(workspace, accountKey),
+    };
+  });
+}
+
+async function inspectWorkspaceAuth(
+  workspace: WorkspaceConfig,
+  accountKey: string,
+): Promise<AuthProviderReport> {
+  try {
+    const credentials = await readWorkspaceCredential(workspace.path);
+    return {
+      provider: "opencode-go",
+      accountKey,
+      sources: [
+        {
+          source: "opencode:workspace-database",
+          status: credentials ? "available" : "invalid",
+        },
+      ],
+    };
+  } catch {
+    return {
+      provider: "opencode-go",
+      accountKey,
+      sources: [
+        {
+          source: "opencode:workspace-database",
+          status: "error",
+          error: "workspace_credentials_unavailable",
+        },
+      ],
+    };
+  }
+}
+
+function readWorkspaceConfig(): WorkspaceConfig[] | undefined {
+  const configPath = userConfigFilePath();
+  traceInput(configPath);
+  const root = objectValue(readJsonFile(configPath));
+  const entries = root?.opencodeGoWorkspaces;
+  if (!Array.isArray(entries) || entries.length === 0) return undefined;
+  const result: WorkspaceConfig[] = [];
+  for (const item of entries) {
+    const record = objectValue(item);
+    const label = record && safeWorkspaceLabel(record.label);
+    const path = record && stringValue(record.path)?.trim();
+    result.push({
+      label: label ?? `workspace ${result.length + 1}`,
+      path: path ?? "",
+    });
+  }
+  return result.length ? result : undefined;
+}
+
+function safeWorkspaceLabel(value: unknown): string | undefined {
+  const label = stringValue(value)?.trim();
+  return label &&
+    label.length <= 48 &&
+    /^[\p{L}\p{N}][\p{L}\p{N} ._-]*$/u.test(label)
+    ? label
+    : undefined;
+}
+
+function workspaceAccountKey(label: string): string {
+  const slug = label
+    .toLowerCase()
+    .replace(/[^a-z0-9]+/g, "-")
+    .replace(/^-|-$/g, "");
+  return (slug || "workspace").slice(0, 96);
+}
+
+async function fetchWorkspaceQuota(
+  workspace: WorkspaceConfig,
+  label: string,
+  dependencies: Dependencies,
+): Promise<ProviderQuota> {
+  let credentials: WorkspaceCredential | undefined;
+  try {
+    credentials = await readWorkspaceCredential(workspace.path);
+  } catch {
+    return workspaceFailure(label, "workspace_credentials_unavailable");
+  }
+  if (!credentials)
+    return workspaceFailure(label, "workspace_credentials_unavailable");
+  try {
+    const signal = AbortSignal.timeout(DEADLINE_MS);
+    const response = await dependencies.workspaceFetch(OPENCODE_GO_STATUS_URL, {
+      method: "GET",
+      headers: {
+        Authorization: `Bearer ${credentials.accessToken}`,
+        "x-org-id": credentials.orgId,
+        Accept: "application/json",
+      },
+      credentials: "omit",
+      redirect: "manual",
+      signal,
+    });
+    if (!response.ok) {
+      void response.body?.cancel().catch(() => undefined);
+      return workspaceFailure(
+        label,
+        response.status === 401 || response.status === 403
+          ? "provider_auth_rejected"
+          : "workspace_quota_unavailable",
+      );
+    }
+    const body = await readBoundedResponseBody(
+      response,
+      signal,
+      () => new Error("workspace_quota_unavailable"),
+    );
+    const normalized = normalizeWorkspaceStatus(
+      JSON.parse(new TextDecoder().decode(body)),
+    );
+    if (normalized.length === 0)
+      return workspaceFailure(label, "workspace_quota_unavailable");
+    return successProvider({
+      provider: "opencode-go",
+      label,
+      source: "api",
+      plan: "OpenCode Go",
+      windows: normalized,
+      refreshedAt: new Date(dependencies.now()).toISOString(),
+      sourcesTried: ["opencode:workspace-database", "api"],
+    });
+  } catch {
+    return workspaceFailure(label, "workspace_quota_unavailable");
+  }
+}
+
+function workspaceFailure(label: string, error: string): ProviderQuota {
+  return failedProvider({
+    provider: "opencode-go",
+    label,
+    status: "error",
+    error,
+    source: "api",
+    sourcesTried: ["opencode:workspace-database", "api"],
+  });
+}
+
+async function readWorkspaceCredential(
+  path: string,
+): Promise<WorkspaceCredential | undefined> {
+  traceInput(path);
+  const query =
+    "SELECT (SELECT access_token FROM account LIMIT 1) AS access_token, (SELECT active_org_id FROM account_state LIMIT 1) AS active_org_id;";
+  const output = await execFileText(
+    "sqlite3",
+    ["-readonly", "-json", path, query],
+    SQLITE_TIMEOUT_MS,
+    { maxBufferBytes: 16_384 },
+  );
+  const parsed: unknown = JSON.parse(output);
+  const row = Array.isArray(parsed) ? objectValue(parsed[0]) : undefined;
+  const accessToken = row && usableLiteralSecret(row.access_token);
+  const orgId = row && usableLiteralSecret(row.active_org_id);
+  return accessToken && orgId ? { accessToken, orgId } : undefined;
+}
+
+function normalizeWorkspaceStatus(raw: unknown): QuotaWindow[] {
+  const access = objectValue(objectValue(raw)?.access);
+  const meters = objectValue(access?.meters);
+  if (!meters) return [];
+  const definitions = [
+    ["fiveHour", "five_hour", "session", "5-hour"],
+    ["week", "weekly", "weekly", "week"],
+    ["month", "monthly", "monthly", "month"],
+  ] as const;
+  return definitions.flatMap(([key, id, kind, label]) => {
+    const meter = objectValue(meters[key]);
+    const used = numberValue(meter?.usedMicroCents);
+    const limit = numberValue(meter?.limitMicroCents);
+    if (used === undefined || limit === undefined || limit <= 0) return [];
+    const percentUsed = Math.min(
+      100,
+      Math.max(0, Math.round((used / limit) * 100_000) / 1_000),
+    );
+    const resetsAt = safeParseReset(meter?.resetsAt ?? meter?.resetAt);
+    return [
+      {
+        id,
+        label,
+        kind,
+        percentUsed,
+        percentRemaining: 100 - percentUsed,
+        spentUsd: used / 100_000_000,
+        limitUsd: limit / 100_000_000,
+        ...(resetsAt ? { resetsAt } : {}),
+      },
+    ];
+  });
+}
 
 type ResolvedCredentialSource = {
   name: string;
