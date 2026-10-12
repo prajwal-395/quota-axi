@@ -1,4 +1,10 @@
-import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
@@ -55,6 +61,166 @@ function usageResponse(): Response {
 }
 
 describe("OpenCode Go provider", () => {
+  it("reports configured workspace meters independently without exposing credentials or ids", async () => {
+    const root = mkdtempSync(join(tmpdir(), "quota-axi-opencode-workspaces-"));
+    const priorXdg = process.env.XDG_CONFIG_HOME;
+    const mainDb = join(
+      process.cwd(),
+      "test/fixtures/opencode-go/workspace.db",
+    );
+    const secondDb = join(
+      process.cwd(),
+      "test/fixtures/opencode-go/workspace-second.db",
+    );
+    try {
+      mkdirSync(join(root, "quota-axi"), { recursive: true });
+      writeFileSync(
+        join(root, "quota-axi/config.json"),
+        JSON.stringify({
+          opencodeGoWorkspaces: [
+            { label: "main", path: mainDb },
+            { label: "second", path: secondDb },
+          ],
+        }),
+      );
+      process.env.XDG_CONFIG_HOME = root;
+      const request = vi.fn(
+        async (_url: string | URL | Request, init?: RequestInit) => {
+          const org = new Headers(init?.headers).get("x-org-id");
+          return new Response(
+            JSON.stringify({
+              access: {
+                meters: {
+                  fiveHour: {
+                    usedMicroCents: org === "fixture-workspace-id" ? 216 : 0,
+                    limitMicroCents: 1000,
+                    resetAt: null,
+                  },
+                  week: {
+                    usedMicroCents: 199,
+                    limitMicroCents: 1000,
+                    resetAt: "2026-10-19T00:00:00Z",
+                  },
+                  month: {
+                    usedMicroCents: 500,
+                    limitMicroCents: 1000,
+                    resetAt: "2026-11-06T15:22:44Z",
+                  },
+                },
+              },
+            }),
+            { status: 200 },
+          );
+        },
+      );
+      const adapter = createOpenCodeGoAdapter({ workspaceFetch: request });
+      const accounts = await adapter.discoverAccounts?.();
+      expect(accounts?.map((account) => account.accountKey)).toEqual([
+        "main",
+        "second",
+      ]);
+      const reports = await Promise.all(
+        accounts!.map((account) => account.fetchQuota(OPTIONS)),
+      );
+      expect(reports.map((report) => report.label)).toEqual([
+        "OpenCode Go · main",
+        "OpenCode Go · second",
+      ]);
+      expect(reports[0]?.windows).toMatchObject([
+        { id: "five_hour", percentUsed: 21.6, spentUsd: 0.00000216 },
+        {
+          id: "weekly",
+          percentUsed: 19.9,
+          resetsAt: "2026-10-19T00:00:00.000Z",
+        },
+        { id: "monthly", percentUsed: 50 },
+      ]);
+      expect(reports[1]?.windows[0]?.resetsAt).toBeUndefined();
+      expect(request).toHaveBeenCalledTimes(2);
+      const sent = request.mock.calls.map((call) => ({
+        authorization: new Headers(call[1]?.headers).get("authorization"),
+        org: new Headers(call[1]?.headers).get("x-org-id"),
+      }));
+      expect(sent).toEqual([
+        {
+          authorization: "Bearer fixture-access-token",
+          org: "fixture-workspace-id",
+        },
+        {
+          authorization: "Bearer fixture-second-access-token",
+          org: "fixture-second-workspace-id",
+        },
+      ]);
+      const output = JSON.stringify(reports);
+      for (const secret of [
+        "fixture-access-token",
+        "fixture-second-access-token",
+        "fixture-workspace-id",
+        "fixture-second-workspace-id",
+      ])
+        expect(output).not.toContain(secret);
+    } finally {
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = priorXdg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("turns one workspace database failure into that workspace's attention row only", async () => {
+    const root = mkdtempSync(join(tmpdir(), "quota-axi-opencode-workspaces-"));
+    const priorXdg = process.env.XDG_CONFIG_HOME;
+    const fixtureDb = join(
+      process.cwd(),
+      "test/fixtures/opencode-go/workspace-second.db",
+    );
+    try {
+      mkdirSync(join(root, "quota-axi"), { recursive: true });
+      writeFileSync(
+        join(root, "quota-axi/config.json"),
+        JSON.stringify({
+          opencodeGoWorkspaces: [
+            { label: "main", path: join(root, "missing.db") },
+            { label: "second", path: fixtureDb },
+          ],
+        }),
+      );
+      process.env.XDG_CONFIG_HOME = root;
+      const adapter = createOpenCodeGoAdapter({
+        workspaceFetch: vi.fn(
+          async () =>
+            new Response(
+              JSON.stringify({
+                access: {
+                  meters: {
+                    fiveHour: { usedMicroCents: 0, limitMicroCents: 1000 },
+                  },
+                },
+              }),
+              { status: 200 },
+            ),
+        ),
+      });
+      const accounts = await adapter.discoverAccounts?.();
+      const reports = await Promise.all(
+        accounts!.map((account) => account.fetchQuota(OPTIONS)),
+      );
+      expect(
+        reports.map((report) => [report.label, report.state.status]),
+      ).toEqual([
+        ["OpenCode Go · main", "error"],
+        ["OpenCode Go · second", "fresh"],
+      ]);
+      expect(reports[0]?.state.error).toBe("workspace_credentials_unavailable");
+      expect(JSON.stringify(reports)).not.toContain(
+        "fixture-second-workspace-id",
+      );
+    } finally {
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = priorXdg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
   it("discovers the active opencode-go credential and supports the legacy id", () => {
     expect(
       extractOpenCodeGoCredential(

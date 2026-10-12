@@ -103,6 +103,41 @@ describe("renderQuotaTui structure", () => {
     );
   });
 
+  it("renders configured OpenCode Go workspaces as separate labelled cards", () => {
+    const workspace = (
+      accountKey: string,
+      percentUsed: number,
+    ): ProviderQuota =>
+      withQuotaSemantics(
+        {
+          provider: "opencode-go",
+          accountKey,
+          label: `OpenCode Go · ${accountKey}`,
+          plan: "OpenCode Go",
+          windows: [
+            {
+              id: "five_hour",
+              label: "5-hour",
+              kind: "session",
+              percentUsed,
+              percentRemaining: 100 - percentUsed,
+            },
+          ],
+          state: { status: "fresh", stale: false },
+        },
+        GENERATED_AT,
+      );
+    const response: QuotaAxiResponse = {
+      generatedAt: GENERATED_AT,
+      schemaVersion: 6,
+      providers: [workspace("main", 20), workspace("second", 50)],
+    };
+    const lines = renderQuotaTui(response, { colorDepth: "none" }).split("\n");
+    expect(findLine(lines, "account main")).toBeDefined();
+    expect(findLine(lines, "account second")).toBeDefined();
+    expect((lines.join("\n").match(/● opencode-go/g) ?? []).length).toBe(2);
+  });
+
   it("keeps every line within the effective width and aligns card borders", () => {
     const lines = render();
     for (const line of lines) expect(line.length).toBeLessThanOrEqual(100);

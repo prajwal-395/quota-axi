@@ -2472,6 +2472,81 @@ describe("default TOON decision blocks", () => {
     expect(output).not.toContain("unresolved_windows");
   });
 
+  it("emits each configured OpenCode Go workspace in JSON without identifiers", async () => {
+    useTempCache();
+    const priorConfigHome = process.env.XDG_CONFIG_HOME;
+    const configHome = join(tempDir!, "config");
+    mkdirSync(join(configHome, "quota-axi"), { recursive: true });
+    process.env.XDG_CONFIG_HOME = configHome;
+    writeFileSync(
+      join(configHome, "quota-axi", "config.json"),
+      JSON.stringify({
+        opencodeGoWorkspaces: [
+          {
+            label: "main",
+            path: join(process.cwd(), "test/fixtures/opencode-go/workspace.db"),
+          },
+          {
+            label: "second",
+            path: join(
+              process.cwd(),
+              "test/fixtures/opencode-go/workspace-second.db",
+            ),
+          },
+        ],
+      }),
+    );
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string | URL | Request, init?: RequestInit) => {
+        const org = new Headers(init?.headers).get("x-org-id");
+        return new Response(
+          JSON.stringify({
+            access: {
+              meters: {
+                fiveHour: {
+                  usedMicroCents: org === "fixture-workspace-id" ? 20 : 50,
+                  limitMicroCents: 100,
+                  resetAt: null,
+                },
+              },
+            },
+          }),
+          { status: 200 },
+        );
+      }),
+    );
+    try {
+      const output = JSON.parse(
+        await capture(["--provider", "opencode-go", "--json", "--full"]),
+      ) as { providers: ProviderQuota[] };
+      expect(output.providers.map((provider) => provider.accountKey)).toEqual([
+        "main",
+        "second",
+      ]);
+      expect(
+        output.providers.map((provider) => provider.windows[0]?.percentUsed),
+      ).toEqual([20, 50]);
+      expect(
+        output.providers.every(
+          (provider) =>
+            provider.label?.includes("main") ||
+            provider.label?.includes("second"),
+        ),
+      ).toBe(true);
+      const serialized = JSON.stringify(output);
+      for (const secret of [
+        "fixture-access-token",
+        "fixture-second-access-token",
+        "fixture-workspace-id",
+        "fixture-second-workspace-id",
+      ])
+        expect(serialized).not.toContain(secret);
+    } finally {
+      restoreEnvironment("XDG_CONFIG_HOME", priorConfigHome);
+    }
+  });
+
   it("still reports unresolved windows for a set-up OpenCode Go missing a stacked cap", async () => {
     useTempCache();
     PROVIDERS["opencode-go"] = providerWithQuota(freshOpenCodeGoQuota());
