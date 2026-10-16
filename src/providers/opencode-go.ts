@@ -434,6 +434,23 @@ function normalizeWorkspaceStatus(raw: unknown): QuotaWindow[] {
       Math.max(0, Math.round((used / limit) * 100_000) / 1_000),
     );
     const resetsAt = safeParseReset(meter?.resetsAt ?? meter?.resetAt);
+    // Plan-declared cycle lengths fill in the vendor's stacked caps the same
+    // way the usage endpoint's fallbacks do, so workspace windows get a real
+    // pace, runway, and selection scalar instead of `missing_cycle`. The
+    // monthly cap is one calendar month ending at the reported reset, so only
+    // its start is derived.
+    const effectiveWindowSeconds =
+      resetsAt === undefined
+        ? undefined
+        : id === "five_hour"
+          ? FIVE_HOURS_SECONDS
+          : id === "weekly"
+            ? WEEK_SECONDS
+            : undefined;
+    const derivedStartsAt =
+      id === "monthly" && resetsAt !== undefined
+        ? calendarMonthsBefore(resetsAt, 1)
+        : undefined;
     return [
       {
         id,
@@ -443,6 +460,10 @@ function normalizeWorkspaceStatus(raw: unknown): QuotaWindow[] {
         percentRemaining: 100 - percentUsed,
         spentUsd: used / 100_000_000,
         limitUsd: limit / 100_000_000,
+        ...(effectiveWindowSeconds !== undefined
+          ? { windowSeconds: effectiveWindowSeconds }
+          : {}),
+        ...(derivedStartsAt ? { startsAt: derivedStartsAt } : {}),
         ...(resetsAt ? { resetsAt } : {}),
       },
     ];

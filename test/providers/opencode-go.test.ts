@@ -9,6 +9,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describe, expect, it, vi } from "vitest";
 import { withQuotaSemantics } from "../../src/interpretation.js";
+import { calendarMonthsBefore } from "../../src/lib/time.js";
+import type { ProviderQuota } from "../../src/types.js";
 import {
   createOpenCodeGoAdapter,
   createPiOpenCodeGoCredentialSource,
@@ -159,6 +161,186 @@ describe("OpenCode Go provider", () => {
         "fixture-second-workspace-id",
       ])
         expect(output).not.toContain(secret);
+    } finally {
+      if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
+      else process.env.XDG_CONFIG_HOME = priorXdg;
+      rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("computes comparable runway and spendPriority for two workspace accounts, sooner reset first", async () => {
+    const root = mkdtempSync(join(tmpdir(), "quota-axi-opencode-workspaces-"));
+    const priorXdg = process.env.XDG_CONFIG_HOME;
+    const mainDb = join(
+      process.cwd(),
+      "test/fixtures/opencode-go/workspace.db",
+    );
+    const secondDb = join(
+      process.cwd(),
+      "test/fixtures/opencode-go/workspace-second.db",
+    );
+    try {
+      mkdirSync(join(root, "quota-axi"), { recursive: true });
+      writeFileSync(
+        join(root, "quota-axi/config.json"),
+        JSON.stringify({
+          opencodeGoWorkspaces: [
+            { label: "main", path: mainDb },
+            { label: "second", path: secondDb },
+          ],
+        }),
+      );
+      process.env.XDG_CONFIG_HOME = root;
+      // Captain-shaped evidence: main holds 92.8/57.3/64.2% remaining with a
+      // Nov 8 monthly reset; second holds 93.6/79.9/40.0% with a Nov 6 reset.
+      const metersFor = (main: boolean) => ({
+        fiveHour: {
+          usedMicroCents: main ? 72 : 64,
+          limitMicroCents: 1000,
+          resetAt: "2026-10-15T05:53:00Z",
+        },
+        week: {
+          usedMicroCents: main ? 427 : 201,
+          limitMicroCents: 1000,
+          resetAt: "2026-10-19T00:00:00Z",
+        },
+        month: {
+          usedMicroCents: main ? 358 : 600,
+          limitMicroCents: 1000,
+          resetAt: main ? "2026-11-08T00:00:00Z" : "2026-11-06T00:00:00Z",
+        },
+      });
+      const request = vi.fn(
+        async (_url: string | URL | Request, init?: RequestInit) => {
+          const org = new Headers(init?.headers).get("x-org-id");
+          const main = org === "fixture-workspace-id";
+          return new Response(
+            JSON.stringify({ access: { meters: metersFor(main) } }),
+            { status: 200 },
+          );
+        },
+      );
+      const adapter = createOpenCodeGoAdapter({ workspaceFetch: request });
+      const accounts = await adapter.discoverAccounts?.();
+      const reports = await Promise.all(
+        accounts!.map((account) => account.fetchQuota(OPTIONS)),
+      );
+
+      // Reproduction shape: cycle-less windows exactly as the adapter used to
+      // emit them block both derived signals on every bound.
+      const cycleLess = (remaining: number, resetsAt: string) => ({
+        id: "five_hour",
+        label: "5-hour",
+        kind: "session" as const,
+        percentUsed: 100 - remaining,
+        percentRemaining: remaining,
+        resetsAt,
+      });
+      const blocked = withQuotaSemantics(
+        {
+          provider: "opencode-go",
+          label: "OpenCode Go · main",
+          windows: [
+            cycleLess(92.8, "2026-10-15T05:53:00.000Z"),
+            {
+              ...cycleLess(57.3, "2026-10-19T00:00:00.000Z"),
+              id: "weekly",
+              kind: "weekly" as const,
+            },
+            {
+              ...cycleLess(64.2, "2026-11-08T00:00:00.000Z"),
+              id: "monthly",
+              kind: "monthly" as const,
+            },
+          ],
+          state: { status: "fresh", stale: false },
+        },
+        "2026-10-15T02:00:00.000Z",
+      );
+      expect(
+        blocked.quotaSemantics?.effectiveAvailability[0]?.selection,
+      ).toMatchObject({
+        status: "unknown",
+        unmeasurableWindowIds: ["five_hour", "weekly", "monthly"],
+      });
+      expect(
+        blocked.quotaSemantics?.effectiveAvailability[0]?.runway,
+      ).toMatchObject({
+        status: "unknown",
+        unmeasurableWindowIds: ["five_hour", "weekly", "monthly"],
+      });
+
+      // The fix: workspace windows now carry plan-declared cycles, so both
+      // captain-shaped accounts measure runway and spendPriority.
+      for (const report of reports) {
+        expect(
+          report.windows.find(({ id }) => id === "five_hour"),
+        ).toMatchObject({ windowSeconds: 18_000 });
+        expect(report.windows.find(({ id }) => id === "weekly")).toMatchObject({
+          windowSeconds: 604_800,
+        });
+        expect(
+          report.windows.find(({ id }) => id === "monthly"),
+        ).toHaveProperty("startsAt");
+      }
+      const generatedAt = "2026-10-15T02:00:00.000Z";
+      const interpreted = reports.map((report) =>
+        withQuotaSemantics(report, generatedAt),
+      );
+      for (const report of interpreted) {
+        const [scope] = report.quotaSemantics!.effectiveAvailability;
+        expect(scope?.status).toBe("known");
+        expect(scope?.selection?.status).toBe("known");
+        expect(scope?.selection?.spendPriority).toEqual(expect.any(Number));
+        expect(scope?.runway?.status).not.toBe("unknown");
+      }
+
+      // Binding window resets sooner with quota left ranks to be spent first:
+      // identical remaining, sooner monthly reset wins the scalar.
+      const equalRemaining = (monthlyReset: string): ProviderQuota => ({
+        provider: "opencode-go",
+        windows: [
+          {
+            id: "five_hour",
+            label: "5-hour",
+            kind: "session",
+            percentUsed: 7,
+            percentRemaining: 93,
+            windowSeconds: 18_000,
+            resetsAt: "2026-10-15T05:53:00.000Z",
+          },
+          {
+            id: "weekly",
+            label: "week",
+            kind: "weekly",
+            percentUsed: 30,
+            percentRemaining: 70,
+            windowSeconds: 604_800,
+            resetsAt: "2026-10-19T00:00:00.000Z",
+          },
+          {
+            id: "monthly",
+            label: "month",
+            kind: "monthly",
+            percentUsed: 40,
+            percentRemaining: 60,
+            startsAt: calendarMonthsBefore(monthlyReset, 1)!,
+            resetsAt: monthlyReset,
+          },
+        ],
+        state: { status: "fresh", stale: false },
+      });
+      const sooner = withQuotaSemantics(
+        equalRemaining("2026-11-06T00:00:00.000Z"),
+        generatedAt,
+      ).quotaSemantics!.effectiveAvailability[0]?.selection?.spendPriority;
+      const later = withQuotaSemantics(
+        equalRemaining("2026-11-08T00:00:00.000Z"),
+        generatedAt,
+      ).quotaSemantics!.effectiveAvailability[0]?.selection?.spendPriority;
+      expect(sooner).toEqual(expect.any(Number));
+      expect(later).toEqual(expect.any(Number));
+      expect(sooner!).toBeGreaterThan(later!);
     } finally {
       if (priorXdg === undefined) delete process.env.XDG_CONFIG_HOME;
       else process.env.XDG_CONFIG_HOME = priorXdg;
