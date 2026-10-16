@@ -1,8 +1,15 @@
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  mkdirSync,
+  mkdtempSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir, tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
 import {
+  readTuiAccountLabels,
   readTuiShowPreference,
   userConfigFilePath,
 } from "../../src/lib/user-config.js";
@@ -86,5 +93,113 @@ describe("readTuiShowPreference", () => {
     const file = configFile();
     mkdirSync(file, { recursive: true });
     expect(readTuiShowPreference(file)).toBe("remaining");
+  });
+});
+
+describe("readTuiAccountLabels", () => {
+  // Resolves a lane by its locator path alone, as a profile lane is named.
+  function labels(entries: unknown): (path: string) => string | undefined {
+    const label = readTuiAccountLabels(
+      configFile(JSON.stringify({ tui: { accountLabels: entries } })),
+    );
+    return (path) => label({ accountLocator: { path } });
+  }
+
+  it("names a lane by its home-relative or absolute locator path", () => {
+    const label = labels({
+      "~/.claude-work": " posam ",
+      "/srv/claude/": "shared",
+    });
+
+    expect(label(join(homedir(), ".claude-work"))).toBe("posam");
+    expect(label(join(homedir(), ".claude-work", ""))).toBe("posam");
+    expect(label("/srv/claude")).toBe("shared");
+    expect(label("/srv/claude/../claude")).toBe("shared");
+    expect(label(join(homedir(), ".claude"))).toBeUndefined();
+  });
+
+  it("names a lane by its exact account key, ahead of its locator", () => {
+    const label = readTuiAccountLabels(
+      configFile(
+        JSON.stringify({
+          tui: {
+            accountLabels: {
+              "claude-swap:9a1c20d6b88a9bcec745fb70": " team ",
+              "profile:aaaaaaaaaaaaaaaaaaaaaaaa": "by key",
+              "/srv/claude": "by path",
+            },
+          },
+        }),
+      ),
+    );
+
+    expect(label({ accountKey: "claude-swap:9a1c20d6b88a9bcec745fb70" })).toBe(
+      "team",
+    );
+    expect(label({ accountKey: "claude-swap:9A1C20D6B88A9BCEC745FB70" })).toBe(
+      undefined,
+    );
+    expect(
+      label({
+        accountKey: "profile:aaaaaaaaaaaaaaaaaaaaaaaa",
+        accountLocator: { path: "/srv/claude" },
+      }),
+    ).toBe("by key");
+    expect(
+      label({
+        accountKey: "profile:bbbbbbbbbbbbbbbbbbbbbbbb",
+        accountLocator: { path: "/srv/claude" },
+      }),
+    ).toBe("by path");
+  });
+
+  it("names a lane reached through a symlinked directory", () => {
+    const root = mkdtempSync(join(tmpdir(), "quota-axi-account-labels-"));
+    temporaryDirectories.push(root);
+    const real = join(root, "real");
+    const link = join(root, "link");
+    mkdirSync(real);
+    symlinkSync(real, link, "dir");
+
+    expect(labels({ [link]: "linked" })(real)).toBe("linked");
+    expect(labels({ [real]: "real" })(link)).toBe("real");
+  });
+
+  it("skips only the entries it cannot use", () => {
+    const label = labels({
+      "relative/dir": "relative",
+      "~other/.claude": "other user",
+      "~": "home",
+      "/numeric": 1,
+      "/blank": "   ",
+      "/kept": "kept",
+    });
+
+    expect(label(join(process.cwd(), "relative", "dir"))).toBeUndefined();
+    expect(label(homedir())).toBeUndefined();
+    expect(label(join(process.cwd(), "~"))).toBeUndefined();
+    expect(label("/numeric")).toBeUndefined();
+    expect(label("/blank")).toBeUndefined();
+    expect(label("/kept")).toBe("kept");
+  });
+
+  it("names nothing without a usable setting", () => {
+    for (const contents of [
+      undefined,
+      "not json",
+      "[]",
+      "{}",
+      '{"tui":{}}',
+      '{"tui":{"accountLabels":["/kept"]}}',
+      '{"tui":{"accountLabels":"/kept"}}',
+      '{"accountLabels":{"/kept":"kept"}}',
+    ]) {
+      expect(
+        readTuiAccountLabels(configFile(contents))({
+          accountLocator: { path: "/kept" },
+        }),
+        contents,
+      ).toBe(undefined);
+    }
   });
 });
