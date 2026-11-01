@@ -18,10 +18,8 @@ import {
 } from "../lib/fs.js";
 import { providerFetch } from "../lib/http.js";
 import {
-  CLAUDE_KEYCHAIN_SERVICE,
   CLAUDE_OAUTH_TOKEN_ENV,
   claudeEnvOauthToken,
-  isOpaqueSuffixedKeychainService,
   claudeListedProfiles,
   claudeProfileLocations,
 } from "../lib/claude-profile.js";
@@ -79,6 +77,13 @@ const CLAUDE_CODE_USER_AGENT = "claude-code/2.1.202";
 const API_TIMEOUT_MS = 15_000;
 const KEYCHAIN_PROMPT_TIMEOUT_MS = 60_000;
 const KEYCHAIN_PRESENCE_TIMEOUT_MS = 5_000;
+/**
+ * A `security` child is never signalled: killing it mid-request races
+ * securityd's client teardown, which has crashed securityd and relocked the
+ * login keychain. Past the timeout the read stops waiting and the child
+ * finishes on its own.
+ */
+const KEYCHAIN_CALL_OPTIONS = { abandonOnTimeout: true } as const;
 /** `security` exit 44 is cannot-reach (locked, TCC, daemon), not item-absent. */
 const KEYCHAIN_ITEM_UNREACHABLE_EXIT_CODE = 44;
 const KEYCHAIN_UNREACHABLE_ERROR = "keychain_unreachable";
@@ -126,14 +131,7 @@ type CredentialState =
   | AdvisoryExpiredCredentialState
   | UnavailableCredentialState
   | SkippedCredentialState;
-type KeychainItemPresence = "present" | "missing" | "unknown" | "unreachable";
-type KeychainCandidate = {
-  service: string;
-  keychain: string;
-};
-type KeychainSelection =
-  | { status: "present"; item: KeychainCandidate }
-  | { status: "missing" | "unknown" };
+type KeychainItemPresence = "present" | "unknown" | "unreachable";
 type ClaudeAccount = NonNullable<ProviderQuota["account"]>;
 type ClaudeIdentityResult = {
   account: ClaudeAccount;
@@ -145,14 +143,7 @@ type ClaudeProfileLocations = {
   credentialFile?: string;
   keychainAccount: string;
   keychainService: string;
-  acceptsOpaqueDefaultItem: boolean;
-  keychainPath?: string;
   keychainAccessMarker: string;
-  /**
-   * Keychain services other reported profiles own. A default selection never
-   * takes one of them for its own opaque item: that item is a sibling lane's.
-   */
-  siblingServices?: ReadonlySet<string>;
 };
 
 type RawUsageWindow = {
@@ -202,11 +193,12 @@ export const claudeAdapter: ProviderAdapter = {
 /**
  * How one profile lane is read. `envEligible` marks the process-selected
  * lane, the only one `CLAUDE_CODE_OAUTH_TOKEN` describes; `keychain` shares
- * one metadata listing across the lanes of a single read.
+ * one exact presence lookup per service across discovery and the lanes of a
+ * single read.
  */
 type ClaudeLane = {
   envEligible: boolean;
-  keychain?: KeychainMetadataCache;
+  keychain?: KeychainPresenceCache;
 };
 
 /** The process-selected profile, read exactly as it is without discovery. */
@@ -267,23 +259,14 @@ async function discoverClaudeAccounts(
   const listed = claudeListedProfiles();
   if (!listed) return undefined;
   const darwin = process.platform === "darwin";
-  // One metadata listing for the whole read: discovery and every lane share
-  // it, so an N-profile run issues one bounded dump, not N+1.
-  const keychain = darwin ? keychainMetadataCache() : undefined;
-  const lanes = await discoverClaudeProfiles(
-    listed.dirs,
-    async (profile, siblingServices) =>
-      keychainItemPresent(
-        resolveClaudeProfileLocations(profile, siblingServices),
-        keychain,
-      ),
+  // One presence lookup per service for the whole read: discovery and the
+  // lane it enrolls share it, so no profile costs more than one Keychain call.
+  const keychain = darwin ? keychainPresenceCache() : undefined;
+  const lanes = await discoverClaudeProfiles(listed.dirs, async (profile) =>
+    keychainItemPresent(resolveClaudeProfileLocations(profile), keychain),
   );
-  const services = lanes.map(({ profile }) => profile.keychainService);
   return lanes.map(({ profile, selected }): ProviderAccount => {
     const lane: ClaudeLane = { envEligible: selected, keychain };
-    const siblingServices = new Set(
-      services.filter((service) => service !== profile.keychainService),
-    );
     return {
       accountKey: claudeAccountKey(profile),
       locator: {
@@ -301,13 +284,12 @@ async function discoverClaudeAccounts(
             refreshCredentials: options.refreshCredentials && selected,
           },
           profile,
-          siblingServices,
           lane,
         ),
       inspectAuth: (options) =>
         inspectClaudeProfileAuth(
           options,
-          resolveClaudeProfileLocations(profile, siblingServices),
+          resolveClaudeProfileLocations(profile),
           lane,
         ),
     };
@@ -412,17 +394,18 @@ function claudeSwapError(account: ClaudeSwapAccount): string {
 }
 
 /**
- * Positive metadata evidence that a profile's exact Keychain item exists. No
- * value is read and nothing can prompt; an inconclusive listing falls back to
- * the same pinned presence check plain calls already make.
+ * Whether a profile's exact Keychain item is there to enroll its lane. A
+ * recorded access marker already proves an earlier value read of this exact
+ * service and account, so the lane's own value read is the only Keychain call
+ * that profile costs; otherwise one exact, value-free, non-prompting lookup
+ * decides, and the lane reuses its answer.
  */
 async function keychainItemPresent(
   locations: ClaudeProfileLocations,
-  keychain: KeychainMetadataCache | undefined,
+  keychain: KeychainPresenceCache | undefined,
 ): Promise<boolean> {
-  const selection = await listKeychainItem(locations, keychain);
-  if (selection.status !== "unknown") return selection.status === "present";
-  return (await readKeychainItemPresence(locations)) === "present";
+  if (hasKeychainAccessMarker(locations)) return true;
+  return (await readKeychainItemPresence(locations, keychain)) === "present";
 }
 
 /**
@@ -433,7 +416,6 @@ async function keychainItemPresent(
 async function fetchClaudeLaneQuota(
   options: ProviderOptions,
   profile: ClaudeProfile,
-  siblingServices: ReadonlySet<string>,
   lane: ClaudeLane,
 ): Promise<ProviderQuota> {
   const storedContextId = claudeStoredProfileContextId(profile);
@@ -444,7 +426,7 @@ async function fetchClaudeLaneQuota(
     : storedContextId;
   const report = await fetchClaudeProfileQuota(
     options,
-    resolveClaudeProfileLocations(profile, siblingServices),
+    resolveClaudeProfileLocations(profile),
     lane,
     contextId,
     () => retireCachedContext("claude", storedContextId),
@@ -538,7 +520,7 @@ async function fetchClaudeProfileQuota(
       const run = await runRefreshDelegate(CLAUDE_CLI_REFRESH_DELEGATE);
       attempts.push(refreshDelegateAttempt(CLAUDE_CLI_REFRESH_DELEGATE, run));
       if (run.status === "ran") {
-        // The vendor may have replaced the item it owns, so a shared listing
+        // The vendor may have replaced the item it owns, so a shared lookup
         // cannot speak for the store this pass is about to re-read.
         lane.keychain?.invalidate();
         const retry = await attemptClaudeQuota(
@@ -1488,33 +1470,22 @@ async function readCredentialStates(
       ),
     );
 
+  // One exact service/account call per pass, searching the whole Keychain
+  // search list: the value read when a grant allows it, otherwise a value-free
+  // presence lookup. Neither can establish sign-out (see keychainPresenceState).
   if (process.platform === "darwin") {
-    const selection = await listKeychainItem(locations, lane.keychain);
-    if (selection.status === "missing") {
-      states.push(keychainPresenceState("missing"));
-      return states;
-    }
-    // Inconclusive metadata never establishes sign-out. The exact vendor
-    // service/account lookup still searches the whole Keychain search list.
-    if (selection.status === "present")
-      locations = withDiscoveredKeychainItem(locations, selection.item);
     if (options.allowKeychainPrompt || hasKeychainAccessMarker(locations)) {
       states.push(await readKeychainCredentialState(locations));
     } else {
-      states.push(await readSkippedKeychainCredentialState(locations));
+      states.push(
+        keychainPresenceState(
+          await readKeychainItemPresence(locations, lane.keychain),
+        ),
+      );
     }
   }
 
   return states;
-}
-
-async function readSkippedKeychainCredentialState(
-  locations: ClaudeProfileLocations,
-): Promise<CredentialState> {
-  const presence = locations.keychainPath
-    ? "present"
-    : await readKeychainItemPresence(locations);
-  return keychainPresenceState(presence);
 }
 
 function keychainPresenceState(
@@ -1531,14 +1502,10 @@ function keychainPresenceState(
       },
     };
   }
-  if (presence === "missing") {
-    return {
-      status: "missing",
-      source: { source: "keychain", status: "missing" },
-    };
-  }
-  // A store that could not be checked still stays visible behind a sibling
-  // that answered, without claiming the item is there.
+  // `security` exit 44 cannot tell a missing item from an unreachable store,
+  // so no exact lookup establishes sign-out. A store that could not be checked
+  // still stays visible behind a sibling that answered, without claiming the
+  // item is there.
   return {
     status: "skipped",
     degraded: true,
@@ -1555,6 +1522,13 @@ function keychainPresenceState(
 
 async function readKeychainItemPresence(
   locations: ClaudeProfileLocations,
+  cache?: KeychainPresenceCache,
+): Promise<KeychainItemPresence> {
+  return cache ? cache.read(locations) : lookupKeychainItemPresence(locations);
+}
+
+async function lookupKeychainItemPresence(
+  locations: ClaudeProfileLocations,
 ): Promise<KeychainItemPresence> {
   try {
     await execFileText(
@@ -1567,6 +1541,7 @@ async function readKeychainItemPresence(
         locations.keychainService,
       ],
       KEYCHAIN_PRESENCE_TIMEOUT_MS,
+      KEYCHAIN_CALL_OPTIONS,
     );
     return "present";
   } catch (error) {
@@ -1574,150 +1549,34 @@ async function readKeychainItemPresence(
   }
 }
 
-// Re-resolve metadata on each credential pass: a TUI must notice replaced
-// items and changed search lists without retaining a stale service/path pin.
-async function listKeychainItem(
-  locations: ClaudeProfileLocations,
-  cache?: KeychainMetadataCache,
-): Promise<KeychainSelection> {
-  const snapshot = await (cache ? cache.read() : readKeychainMetadata());
-  return snapshot
-    ? selectKeychainItem(snapshot.metadata, locations, snapshot.paths)
-    : { status: "unknown" };
-}
-
-type KeychainMetadataSnapshot = { metadata: string; paths: string[] };
-
-type KeychainMetadataCache = {
-  read: () => Promise<KeychainMetadataSnapshot | undefined>;
+type KeychainPresenceCache = {
+  read: (locations: ClaudeProfileLocations) => Promise<KeychainItemPresence>;
   invalidate: () => void;
 };
 
 /**
- * One listing per read, shared by discovery and every lane it enrolls. It is
- * deliberately not process-wide: a live `--tui` must still notice a replaced
- * item on its next refresh, and a delegated refresh invalidates it at once.
+ * One exact presence lookup per account and service per read, shared by
+ * discovery and every lane it enrolls. It is deliberately not process-wide: a
+ * live `--tui` must still notice a sign-in or a replaced item on its next
+ * refresh, and a delegated refresh invalidates it at once.
  */
-function keychainMetadataCache(): KeychainMetadataCache {
-  let snapshot: Promise<KeychainMetadataSnapshot | undefined> | undefined;
+function keychainPresenceCache(): KeychainPresenceCache {
+  const lookups = new Map<string, Promise<KeychainItemPresence>>();
   return {
-    read: () => (snapshot ??= readKeychainMetadata()),
-    invalidate: () => {
-      snapshot = undefined;
+    read: (locations) => {
+      const key = JSON.stringify([
+        locations.keychainAccount,
+        locations.keychainService,
+      ]);
+      let lookup = lookups.get(key);
+      if (!lookup) {
+        lookup = lookupKeychainItemPresence(locations);
+        lookups.set(key, lookup);
+      }
+      return lookup;
     },
+    invalidate: () => lookups.clear(),
   };
-}
-
-async function readKeychainMetadata(): Promise<
-  KeychainMetadataSnapshot | undefined
-> {
-  try {
-    const output = await execFileText(
-      "security",
-      ["list-keychains"],
-      KEYCHAIN_PRESENCE_TIMEOUT_MS,
-    );
-    const paths: string[] = [];
-    for (const line of output.split(/\r?\n/)) {
-      if (!line.trim()) continue;
-      const path = /^\s*"(\/[^"\n]+)"\s*$/.exec(line)?.[1];
-      if (!path) return undefined;
-      if (!paths.includes(path)) paths.push(path);
-    }
-    if (!paths.length) return undefined;
-    // Search the same keychains as an unqualified exact read. Metadata only:
-    // no -d (values), -r (raw data), -a (ACLs), or -i (ACL editing). One bounded
-    // dump (5s / 16 MiB) covers the list; failure withholds any absence verdict.
-    const metadata = await execFileText(
-      "security",
-      ["dump-keychain", ...paths],
-      KEYCHAIN_PRESENCE_TIMEOUT_MS,
-    );
-    return { metadata, paths };
-  } catch {
-    return undefined;
-  }
-}
-
-function selectKeychainItem(
-  metadata: string,
-  locations: ClaudeProfileLocations,
-  paths: string[],
-): KeychainSelection {
-  let exactItem: KeychainCandidate | undefined;
-  // Keyed by service: the same item can appear in several search-list
-  // keychains, and only distinct services are distinct candidates.
-  const opaqueItems = new Map<string, KeychainCandidate>();
-  const seenKeychains = new Set<string>();
-  let inconclusive = false;
-  for (const record of metadata.split(/(?=^keychain: )/m)) {
-    if (!record.trim()) continue;
-    const keychain = keychainMetadataValue(
-      /^keychain: (.+)$/m.exec(record)?.[1],
-    );
-    const kind = /^class: (.+)$/m.exec(record)?.[1];
-    if (!keychain || !paths.includes(keychain) || !kind) {
-      inconclusive = true;
-      continue;
-    }
-    seenKeychains.add(keychain);
-    if (kind !== '"genp"') continue;
-    const service = keychainMetadataValue(
-      /^\s+"svce"<blob>=(.+)$/m.exec(record)?.[1],
-    );
-    const itemAccount = keychainMetadataValue(
-      /^\s+"acct"<blob>=(.+)$/m.exec(record)?.[1],
-    );
-    if (service === undefined || itemAccount === undefined) {
-      inconclusive = true;
-      continue;
-    }
-    // Another account name can own the live session's item, and an unfamiliar
-    // Claude-prefixed item can belong to a profile this process did not
-    // select. Never open those or use them to assert a sign-out.
-    const claudeOwned = service.startsWith(CLAUDE_KEYCHAIN_SERVICE);
-    if (itemAccount !== locations.keychainAccount) {
-      if (claudeOwned) inconclusive = true;
-      continue;
-    }
-    // Another reported profile's own item: known, and known not to be ours.
-    if (locations.siblingServices?.has(service)) continue;
-    const opaque =
-      locations.acceptsOpaqueDefaultItem &&
-      isOpaqueSuffixedKeychainService(service);
-    if (service !== locations.keychainService && !opaque) {
-      if (claudeOwned) inconclusive = true;
-      continue;
-    }
-    // Duplicates follow the vendor's lookup ordering, independent of dump order.
-    const earlier = opaque ? opaqueItems.get(service) : exactItem;
-    if (earlier && paths.indexOf(earlier.keychain) <= paths.indexOf(keychain))
-      continue;
-    if (opaque) opaqueItems.set(service, { service, keychain });
-    else exactItem = { service, keychain };
-  }
-  // The exact selector always wins. Failing that, a default selection cannot
-  // re-derive its own opaque suffix, so it accepts one only when a single
-  // eligible item exists; several are indistinguishable and none is opened.
-  if (exactItem) return { status: "present", item: exactItem };
-  // Uniqueness, like absence, requires the whole search list: incomplete or
-  // inconclusive metadata can hide the selected item or a competing profile.
-  if (inconclusive || paths.some((path) => !seenKeychains.has(path)))
-    return { status: "unknown" };
-  if (opaqueItems.size === 1)
-    return { status: "present", item: [...opaqueItems.values()][0]! };
-  if (opaqueItems.size > 1) return { status: "unknown" };
-  return { status: "missing" };
-}
-
-// security's print_buffer emits printable bytes in quotes, or hex followed by
-// an optional ASCII annotation. Decode only the small metadata fields we use.
-function keychainMetadataValue(raw?: string): string | undefined {
-  if (!raw || raw.length > 8192) return undefined;
-  if (raw === "<NULL>") return "";
-  const hex = /^0x((?:[0-9a-fA-F]{2})+)(?:\s|$)/.exec(raw)?.[1];
-  if (hex) return Buffer.from(hex, "hex").toString("utf8");
-  return /^"(.*)"$/.exec(raw)?.[1];
 }
 
 async function readKeychainCredentialState(
@@ -1734,9 +1593,9 @@ async function readKeychainCredentialState(
         "-w",
         "-s",
         locations.keychainService,
-        ...(locations.keychainPath ? [locations.keychainPath] : []),
       ],
       KEYCHAIN_PROMPT_TIMEOUT_MS,
+      KEYCHAIN_CALL_OPTIONS,
     );
   } catch (error) {
     return keychainFailureState(error);
@@ -1757,21 +1616,6 @@ async function readKeychainCredentialState(
       },
     };
   }
-}
-
-function withDiscoveredKeychainItem(
-  locations: ClaudeProfileLocations,
-  item: KeychainCandidate,
-): ClaudeProfileLocations {
-  return {
-    ...locations,
-    keychainService: item.service,
-    keychainPath: item.keychain,
-    keychainAccessMarker: claudeKeychainAccessMarkerPath(
-      locations.keychainAccount,
-      item.service,
-    ),
-  };
 }
 
 function hasKeychainAccessMarker(locations: ClaudeProfileLocations): boolean {
@@ -1820,14 +1664,8 @@ export function claudeKeychainAccount(): string {
 
 function resolveClaudeProfileLocations(
   profile: ClaudeProfile = claudeProfileLocations(),
-  siblingServices?: ReadonlySet<string>,
 ): ClaudeProfileLocations {
-  const {
-    configDir,
-    secureStorageSelected,
-    keychainService,
-    acceptsOpaqueDefaultItem,
-  } = profile;
+  const { configDir, secureStorageSelected, keychainService } = profile;
   const keychainAccount = claudeKeychainAccount();
   return {
     credentialFile:
@@ -1836,12 +1674,10 @@ function resolveClaudeProfileLocations(
         : join(configDir, ".credentials.json"),
     keychainAccount,
     keychainService,
-    acceptsOpaqueDefaultItem,
     keychainAccessMarker: claudeKeychainAccessMarkerPath(
       keychainAccount,
       keychainService,
     ),
-    ...(siblingServices?.size ? { siblingServices } : {}),
   };
 }
 
@@ -1854,11 +1690,13 @@ function isKeychainItemUnreachable(error: unknown): boolean {
 
 function keychainFailureState(error: unknown): CredentialState {
   const failure = error as {
+    abandoned?: boolean;
     killed?: boolean;
     signal?: string | null;
     code?: number | string | null;
   };
-  if (failure.killed || failure.signal) {
+  // An abandoned child outlived the wait and was left running, unsignalled.
+  if (failure.abandoned || failure.killed || failure.signal) {
     return {
       status: "skipped",
       source: {

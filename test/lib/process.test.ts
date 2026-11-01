@@ -1,5 +1,11 @@
 import { spawn } from "node:child_process";
-import { chmodSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  mkdtempSync,
+  rmSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -42,6 +48,47 @@ describe("commandExists", () => {
     expect(await commandExists(command)).toBe(true);
     expect(await commandExists("quota-axi-missing")).toBe(false);
   });
+});
+
+describe("execFileText abandonOnTimeout", () => {
+  it.skipIf(process.platform === "win32")(
+    "stops waiting at the timeout without signalling the child",
+    async () => {
+      tempDir = mkdtempSync(join(tmpdir(), "quota-axi-abandon-"));
+      const done = join(tempDir, "done");
+      const signalled = join(tempDir, "signalled");
+      // The child records a signal if it gets one, and its own completion.
+      const script = [
+        "const fs = require('node:fs');",
+        `process.on('SIGTERM', () => { fs.writeFileSync(${JSON.stringify(signalled)}, ''); process.exit(1); });`,
+        `setTimeout(() => { fs.writeFileSync(${JSON.stringify(done)}, ''); process.stdout.write('ok'); }, 400);`,
+      ].join("");
+      const started = Date.now();
+      const failure = await execFileText(process.execPath, ["-e", script], 50, {
+        abandonOnTimeout: true,
+      }).catch((error: unknown) => error);
+      expect(Date.now() - started).toBeLessThan(400);
+      expect(failure).toMatchObject({ abandoned: true, code: "ETIMEDOUT" });
+
+      await new Promise((resolve) => setTimeout(resolve, 800));
+      expect(existsSync(signalled)).toBe(false);
+      expect(existsSync(done)).toBe(true);
+    },
+    10_000,
+  );
+
+  it.skipIf(process.platform === "win32")(
+    "still kills a child at the timeout by default",
+    async () => {
+      const failure = await execFileText(
+        process.execPath,
+        ["-e", "setTimeout(() => {}, 5000)"],
+        50,
+      ).catch((error: unknown) => error);
+      expect(failure).toMatchObject({ killed: true, signal: "SIGTERM" });
+    },
+    10_000,
+  );
 });
 
 describe("terminateChild", () => {

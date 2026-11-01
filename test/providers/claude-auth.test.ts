@@ -86,26 +86,21 @@ function usePlatform(platform: NodeJS.Platform): void {
   });
 }
 
-const fixtureKeychain = "/fixture/login.keychain-db";
-
+/**
+ * A store holding only `service` for the fixture account: an exact lookup of
+ * any other service exits 44, as `security` does.
+ */
 function mockKeychainRead(
   read: (command: string, args: string[]) => Promise<string>,
   service = "Claude Code-credentials",
 ) {
   return vi.fn(async (command: string, args: string[]) => {
-    if (command === "security" && args[0] === "list-keychains") {
-      return `    "${fixtureKeychain}"\n`;
-    }
-    if (command === "security" && args[0] === "dump-keychain") {
-      return `keychain: "${fixtureKeychain}"
-version: 512
-class: "genp"
-attributes:
-    "acct"<blob>="fixture-user"
-    "svce"<blob>="${service}"
-    "mdat"<timedate>="20260701000000Z"
-`;
-    }
+    if (
+      command === "security" &&
+      args[0] === "find-generic-password" &&
+      !args.includes(service)
+    )
+      throw Object.assign(new Error("item not found"), { code: 44 });
     return read(command, args);
   });
 }
@@ -845,16 +840,9 @@ describe("Claude credential-state reporting", () => {
       });
       expect(execFileText).toHaveBeenCalledWith(
         "security",
-        [
-          "find-generic-password",
-          "-a",
-          "fixture-user",
-          "-w",
-          "-s",
-          service,
-          fixtureKeychain,
-        ],
+        ["find-generic-password", "-a", "fixture-user", "-w", "-s", service],
         expect.any(Number),
+        { abandonOnTimeout: true },
       );
     },
   );
@@ -882,8 +870,15 @@ describe("Claude credential-state reporting", () => {
 
     expect(execFileText).toHaveBeenCalledWith(
       "security",
-      ["dump-keychain", fixtureKeychain],
+      [
+        "find-generic-password",
+        "-a",
+        "fixture-user",
+        "-s",
+        `Claude Code-credentials-${suffix}`,
+      ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(
       execFileText.mock.calls.some(([, args]) => args.includes("-w")),
@@ -937,9 +932,9 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         "Claude Code-credentials",
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(auth.sources).toContainEqual({
       source: "keychain",
@@ -1007,9 +1002,9 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         `Claude Code-credentials-${suffix}`,
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(auth.sources).toContainEqual({
       source: "keychain",
@@ -1052,7 +1047,7 @@ describe("Claude credential-state reporting", () => {
   });
 
   it("keeps a refreshable expired session unconfirmed while Claude Code is running", async () => {
-    usePlatform("darwin");
+    usePlatform("linux");
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-07-06T20:00:00.000Z"));
     const home = useTempHome();
@@ -1063,13 +1058,7 @@ describe("Claude credential-state reporting", () => {
     });
     vi.doMock("../../src/lib/process.js", () => ({
       execFileText: vi.fn(async (command: string, args: string[]) => {
-        if (command === "security" && args[0] === "list-keychains") {
-          return `    "${fixtureKeychain}"\n`;
-        }
-        if (command === "security" && args[0] === "dump-keychain") {
-          return `keychain: "${fixtureKeychain}"\nversion: 512\nclass: "genp"\nattributes:\n    "acct"<blob>="fixture-user"\n    "svce"<blob>="other-service"\n`;
-        }
-        throw new Error("unexpected process call");
+        throw new Error(`unexpected process call: ${command} ${args[0]}`);
       }),
     }));
     vi.doMock("../../src/lib/running-processes.js", () => ({
@@ -2670,20 +2659,22 @@ describe("Claude credential-state reporting", () => {
 
     expect(execFileText).toHaveBeenCalledWith(
       "security",
-      ["dump-keychain", fixtureKeychain],
+      [
+        "find-generic-password",
+        "-a",
+        "fixture-user",
+        "-s",
+        "Claude Code-credentials",
+      ],
       expect.any(Number),
-    );
-    expect(execFileText).not.toHaveBeenCalledWith(
-      "security",
-      expect.arrayContaining(["-w"]),
-      expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(
+      execFileText.mock.calls.some(([, args]) => args.includes("-w")),
+    ).toBe(false);
+    expect(
       execFileText.mock.calls.every(
-        ([, args]) =>
-          args[0] === "dump-keychain" ||
-          args[0] === "list-keychains" ||
-          (args.includes("-a") && args.includes("fixture-user")),
+        ([, args]) => args.includes("-a") && args.includes("fixture-user"),
       ),
     ).toBe(true);
     expect(auth.sources).toContainEqual({
@@ -2715,7 +2706,7 @@ describe("Claude credential-state reporting", () => {
       refreshCredentials: false,
     });
 
-    expect(execFileText).toHaveBeenCalledTimes(3);
+    expect(execFileText).toHaveBeenCalledTimes(1);
     expect(execFileText).toHaveBeenCalledWith(
       "security",
       [
@@ -2725,9 +2716,9 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         "Claude Code-credentials",
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(auth.sources).toContainEqual({
       source: "keychain",
@@ -2769,14 +2760,8 @@ describe("Claude credential-state reporting", () => {
       refreshCredentials: false,
     });
 
-    expect(
-      execFileText.mock.calls.filter(
-        ([, args]) => args[0] === "list-keychains",
-      ),
-    ).toHaveLength(2);
-    expect(
-      execFileText.mock.calls.filter(([, args]) => args[0] === "dump-keychain"),
-    ).toHaveLength(2);
+    // One exact value read per pass, and no presence lookup beside it.
+    expect(execFileText).toHaveBeenCalledTimes(2);
     expect(marker).toContain("claude-keychain-access-granted");
     expect(execFileText).toHaveBeenCalledWith(
       "security",
@@ -2787,17 +2772,12 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         "Claude Code-credentials",
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(
-      execFileText.mock.calls.every(
-        ([, args]) =>
-          args[0] === "dump-keychain" ||
-          args[0] === "list-keychains" ||
-          args.includes("-w"),
-      ),
+      execFileText.mock.calls.every(([, args]) => args.includes("-w")),
     ).toBe(true);
     expect(auth.sources).toContainEqual({
       source: "keychain",
@@ -2899,9 +2879,9 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         "Claude Code-credentials",
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     const marker = claudeKeychainAccessMarkerPath(
       "fixture-user",
@@ -3020,7 +3000,7 @@ describe("Claude credential-state reporting", () => {
         attempts: Array<{ source: string; status: string }>;
       }>;
     };
-    expect(execFileText).toHaveBeenCalledTimes(3);
+    expect(execFileText).toHaveBeenCalledTimes(1);
     expect(execFileText).toHaveBeenCalledWith(
       "security",
       [
@@ -3030,9 +3010,9 @@ describe("Claude credential-state reporting", () => {
         "-w",
         "-s",
         "Claude Code-credentials",
-        fixtureKeychain,
       ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(
       execFileText.mock.calls.some(([, args]) => args.includes("unknown")),
@@ -3122,9 +3102,9 @@ describe("Claude credential-state reporting", () => {
           "-w",
           "-s",
           "Claude Code-credentials",
-          fixtureKeychain,
         ],
         expect.any(Number),
+        { abandonOnTimeout: true },
       );
       expect(fetchMock).toHaveBeenCalledWith(
         "https://api.anthropic.com/api/oauth/usage",
@@ -3148,24 +3128,10 @@ describe("Claude credential-state reporting", () => {
     },
   );
 
-  it("does not mark keychain prompt required when the keychain item is missing", async () => {
+  it("does not mark keychain prompt required when the exact lookup finds no item", async () => {
     usePlatform("darwin");
     useTempHome();
-    const unrelatedItem = `keychain: "${fixtureKeychain}"
-version: 512
-class: "genp"
-attributes:
-    "acct"<blob>="fixture-user"
-    "svce"<blob>="other-service"
-    "mdat"<timedate>="20260701000000Z"
-`;
-    const execFileText = vi.fn(async (_command: string, args: string[]) =>
-      args[0] === "list-keychains"
-        ? `    "${fixtureKeychain}"\n`
-        : args[0] === "dump-keychain"
-          ? unrelatedItem
-          : "",
-    );
+    const execFileText = mockKeychainRead(async () => "", "other-service");
     vi.doMock("../../src/lib/process.js", () => ({ execFileText }));
 
     const { fetchQuota, inspectAuth } =
@@ -3181,29 +3147,37 @@ attributes:
 
     expect(execFileText).toHaveBeenCalledWith(
       "security",
-      ["dump-keychain", fixtureKeychain],
+      [
+        "find-generic-password",
+        "-a",
+        "fixture-user",
+        "-s",
+        "Claude Code-credentials",
+      ],
       expect.any(Number),
+      { abandonOnTimeout: true },
     );
     expect(
       execFileText.mock.calls.some(([, args]) => args.includes("-w")),
     ).toBe(false);
     expect(
       execFileText.mock.calls.every(
-        ([, args]) =>
-          args[0] === "dump-keychain" ||
-          args[0] === "list-keychains" ||
-          (args.includes("-a") && args.includes("fixture-user")),
+        ([, args]) => args.includes("-a") && args.includes("fixture-user"),
       ),
     ).toBe(true);
 
+    // Exit 44 cannot tell a missing item from an unreachable store, so the
+    // lookup reports what it saw without asserting a sign-out.
     expect(auth.sources).toContainEqual({
       source: "keychain",
-      status: "missing",
+      status: "skipped",
+      error: "keychain_unreachable",
     });
     expect(result.attempts).toContainEqual({
       source: "keychain",
       status: "skipped",
-      error: "credentials_missing",
+      error: "keychain_unreachable",
+      degraded: true,
     });
     expect(result.attempts).not.toContainEqual(
       expect.objectContaining({

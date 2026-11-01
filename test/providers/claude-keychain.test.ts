@@ -9,28 +9,8 @@ vi.mock("../../src/lib/process.js", () => ({ execFileText }));
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const options = { allowKeychainPrompt: true, refreshCredentials: false };
 const service = "Claude Code-credentials";
-const otherKeychain = "/fixture/Library/Keychains/searchable.keychain-db";
-const keychain = "/fixture/Library/Keychains/login.keychain-db";
+const keychainCall = { abandonOnTimeout: true };
 let home: string;
-
-// Synthetic metadata only, shaped like security dump-keychain (no -d/-r/-a).
-function item(
-  name = service,
-  modified = "20260913010000Z",
-  account = "fixture-user",
-  path = keychain,
-  kind = "genp",
-): string {
-  const date = Buffer.from(`${modified}\0`).toString("hex");
-  return `keychain: "${path}"
-version: 512
-class: "${kind}"
-attributes:
-    "acct"<blob>="${account}"
-    "mdat"<timedate>=0x${date}  "${modified}\\000"
-    "svce"<blob>="${name}"
-`;
-}
 
 beforeEach(() => {
   vi.resetModules();
@@ -100,87 +80,85 @@ function unreachable(): Error {
   return Object.assign(new Error("synthetic item unavailable"), { code: 44 });
 }
 
-function mockItems(
-  metadata: string,
-  readableService = service,
-  keychains = [keychain],
-): void {
+/** A synthetic store holding only `readableService` for the fixture account. */
+function mockItems(readableService = service): void {
   execFileText.mockImplementation(async (command: string, args: string[]) => {
     expect(command).toBe("security");
-    if (args[0] === "list-keychains") {
-      expect(args).toEqual(["list-keychains"]);
-      return keychains.map((path) => `    "${path}"\n`).join("");
-    }
-    if (args[0] === "dump-keychain") {
-      expect(args).toEqual(["dump-keychain", ...keychains]);
-      return metadata;
-    }
     expect(args.slice(0, 3)).toEqual([
       "find-generic-password",
       "-a",
       "fixture-user",
     ]);
-    if (args.includes(readableService)) {
-      return args.includes("-w")
-        ? JSON.stringify({
-            claudeAiOauth: { accessToken: "synthetic-token" },
-          })
-        : "";
-    }
-    throw unreachable();
+    if (!args.includes(readableService)) throw unreachable();
+    return args.includes("-w")
+      ? JSON.stringify({ claudeAiOauth: { accessToken: "synthetic-token" } })
+      : "";
   });
 }
 
-describe("Claude macOS Keychain discovery", () => {
+function grantMarker(granted = service): Promise<void> {
+  return import("../../src/lib/fs.js").then(
+    ({ claudeKeychainAccessMarkerPath }) => {
+      const marker = claudeKeychainAccessMarkerPath("fixture-user", granted);
+      mkdirSync(dirname(marker), { recursive: true });
+      writeFileSync(marker, "granted\n", { mode: 0o600 });
+    },
+  );
+}
+
+describe("Claude macOS Keychain exact lookup", () => {
   it("still reads a legacy unsuffixed item", async () => {
-    mockItems(item("Claude Code-credentials"), "Claude Code-credentials");
+    mockItems("Claude Code-credentials");
     const { fetchQuota } = await import("../../src/providers/claude.js");
     expect((await fetchQuota(options)).state.status).toBe("fresh");
   });
 
-  it("reads the default profile's own suffixed item", async () => {
-    const defaultService = profileService(join(home, ".claude"));
-    mockItems(item(defaultService), defaultService);
+  it("reads only the exact selected service, never another Claude item", async () => {
+    vi.useFakeTimers();
+    vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
+    // Only an opaque-suffixed item is readable; the default profile names the
+    // unsuffixed service and no dump enumerates the store to find another.
+    mockItems("Claude Code-credentials-abcdef12");
+    const { readCachedProvider, writeCachedProviders } =
+      await import("../../src/cache.js");
+    writeCachedProviders([cachedClaude()]);
     const { fetchQuota } = await import("../../src/providers/claude.js");
     const report = await fetchQuota(options);
 
-    expect(report.state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(defaultService);
-    expect(
-      execFileText.mock.calls.filter(([, args]) => args.includes("-w")),
-    ).toHaveLength(1);
+    expect(report.state).toMatchObject({
+      status: "stale",
+      error: "keychain_unreachable",
+    });
+    expect(readCachedProvider("claude")).toBeDefined();
+    expect(execFileText.mock.calls).toEqual([
+      [
+        "security",
+        ["find-generic-password", "-a", "fixture-user", "-w", "-s", service],
+        60000,
+        keychainCall,
+      ],
+    ]);
+    expect(fetch).not.toHaveBeenCalled();
   });
 
-  it("never opens the default directory's suffixed item for an explicit profile", async () => {
+  it("never opens the default profile's item for an explicit profile", async () => {
     const explicitDir = join(home, "explicit-profile");
     vi.stubEnv("CLAUDE_CONFIG_DIR", explicitDir);
-    const defaultService = profileService(join(home, ".claude"));
-    mockItems(item(defaultService) + item(service), "unavailable-service");
+    mockItems(service);
     const { fetchQuota } = await import("../../src/providers/claude.js");
     const report = await fetchQuota(options);
 
     expect(report.state.status).not.toBe("auth_required");
     expect(valueReadArgs()).toContain(profileService(explicitDir));
-    expect(valueReadArgs()).not.toContain(defaultService);
     expect(valueReadArgs()).not.toContain(service);
+    expect(execFileText).toHaveBeenCalledTimes(1);
   });
 
-  it("prefers the exact selector over the equivalent spelling", async () => {
-    const defaultService = profileService(join(home, ".claude"));
-    mockItems(item(defaultService) + item(service), service);
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(service);
-    expect(valueReadArgs()).not.toContain(defaultService);
-  });
-
-  it("reads the suffix selected by Claude secure storage", async () => {
+  it("reads the suffix selected by Claude secure storage in one exact call", async () => {
     const configDir = "/fixture/secure-profile";
     const selectedService = profileService(configDir);
     vi.stubEnv("CLAUDE_SECURESTORAGE_CONFIG_DIR", configDir);
-    mockItems(item(selectedService), selectedService);
+    mockItems(selectedService);
     const { fetchQuota } = await import("../../src/providers/claude.js");
     const report = await fetchQuota(options);
 
@@ -189,8 +167,6 @@ describe("Claude macOS Keychain discovery", () => {
       { id: "five_hour", percentUsed: 12 },
     ]);
     expect(execFileText.mock.calls).toEqual([
-      ["security", ["list-keychains"], 5000],
-      ["security", ["dump-keychain", keychain], 5000],
       [
         "security",
         [
@@ -200,44 +176,17 @@ describe("Claude macOS Keychain discovery", () => {
           "-w",
           "-s",
           selectedService,
-          keychain,
         ],
         60000,
+        keychainCall,
       ],
     ]);
     expect(JSON.stringify(report)).not.toContain("synthetic-token");
     expect(JSON.stringify(report)).not.toContain("fixture-user");
   });
 
-  it("finds a credential in a searchable keychain after the default changes", async () => {
-    mockItems(
-      item("unrelated-service") +
-        item(service, undefined, undefined, otherKeychain),
-      service,
-      [keychain, otherKeychain],
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state.status).toBe("fresh");
-    expect(valueReadArgs()).toEqual([
-      "find-generic-password",
-      "-a",
-      "fixture-user",
-      "-w",
-      "-s",
-      service,
-      otherKeychain,
-    ]);
-    expect(
-      execFileText.mock.calls.some(
-        ([, args]) => args[0] === "default-keychain",
-      ),
-    ).toBe(false);
-  });
-
-  it("discovers presence without reading values until the existing grant policy permits it", async () => {
-    mockItems(item());
+  it("checks presence with one value-free lookup until the grant policy permits a read", async () => {
+    mockItems();
     const { inspectAuth } = await import("../../src/providers/claude.js");
     const auth = await inspectAuth({ ...options, allowKeychainPrompt: false });
     expect(auth.sources).toContainEqual({
@@ -247,15 +196,16 @@ describe("Claude macOS Keychain discovery", () => {
       credentialPresent: true,
     });
     expect(execFileText.mock.calls).toEqual([
-      ["security", ["list-keychains"], 5000],
-      ["security", ["dump-keychain", keychain], 5000],
+      [
+        "security",
+        ["find-generic-password", "-a", "fixture-user", "-s", service],
+        5000,
+        keychainCall,
+      ],
     ]);
 
-    const { claudeKeychainAccessMarkerPath } =
-      await import("../../src/lib/fs.js");
-    const marker = claudeKeychainAccessMarkerPath("fixture-user", service);
-    mkdirSync(dirname(marker), { recursive: true });
-    writeFileSync(marker, "granted\n", { mode: 0o600 });
+    execFileText.mockClear();
+    await grantMarker();
     const granted = await inspectAuth({
       ...options,
       allowKeychainPrompt: false,
@@ -264,15 +214,28 @@ describe("Claude macOS Keychain discovery", () => {
       source: "keychain",
       status: "available",
     });
+    // The grant reads the value directly, with no presence lookup beside it.
+    expect(execFileText).toHaveBeenCalledTimes(1);
+    expect(valueReadArgs()).toContain(service);
+  });
+
+  it("never invokes a whole-keychain listing", async () => {
+    mockItems();
+    const { fetchQuota, inspectAuth } =
+      await import("../../src/providers/claude.js");
+    await inspectAuth({ ...options, allowKeychainPrompt: false });
+    await fetchQuota({ ...options, allowKeychainPrompt: false });
+    await fetchQuota(options);
+    for (const [, args] of execFileText.mock.calls as [string, string[]][]) {
+      expect(args[0]).toBe("find-generic-password");
+      expect(args).not.toContain("dump-keychain");
+      expect(args).not.toContain("list-keychains");
+    }
   });
 
   it("reuses a granted Keychain reading across back-to-back reads with --max-age", async () => {
-    mockItems(item());
-    const { claudeKeychainAccessMarkerPath } =
-      await import("../../src/lib/fs.js");
-    const marker = claudeKeychainAccessMarkerPath("fixture-user", service);
-    mkdirSync(dirname(marker), { recursive: true });
-    writeFileSync(marker, "granted\n", { mode: 0o600 });
+    mockItems();
+    await grantMarker();
     const { quotaCommand } = await import("../../src/commands.js");
 
     for (let read = 0; read < 3; read++) {
@@ -296,191 +259,10 @@ describe("Claude macOS Keychain discovery", () => {
     ).toHaveLength(1);
   });
 
-  it("never lets a newer explicit-profile item replace the default profile", async () => {
-    const explicitService = profileService("/fixture/explicit-profile");
-    mockItems(
-      item(service, "20260101010000Z") +
-        item(explicitService, "20260913020000Z"),
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(service);
-    expect(valueReadArgs()).not.toContain(explicitService);
-    expect(
-      execFileText.mock.calls.filter(([, args]) => args.includes("-w")),
-    ).toHaveLength(1);
-  });
-
-  it("reads the default profile's lone opaque item whatever its suffix", async () => {
-    const opaqueService = "Claude Code-credentials-abcdef12";
-    expect(opaqueService).not.toBe(profileService(join(home, ".claude")));
-    mockItems(item(opaqueService), opaqueService);
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(opaqueService);
-    expect(
-      execFileText.mock.calls.filter(([, args]) => args.includes("-w")),
-    ).toHaveLength(1);
-  });
-
-  it("opens no opaque item when the default profile has more than one", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-    const first = "Claude Code-credentials-abcdef12";
-    const second = profileService(join(home, ".claude"));
-    mockItems(item(first) + item(second), "unavailable-service");
-    const { readCachedProvider, writeCachedProviders } =
-      await import("../../src/cache.js");
-    writeCachedProviders([cachedClaude()]);
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state).toMatchObject({
-      status: "stale",
-      error: "keychain_unreachable",
-    });
-    expect(readCachedProvider("claude")).toBeDefined();
-    expect(valueReadArgs()).toContain(service);
-    expect(valueReadArgs()).not.toContain(first);
-    expect(valueReadArgs()).not.toContain(second);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it.each([
-    {
-      label: "another searchable keychain is omitted",
-      metadata: "",
-      paths: [keychain, otherKeychain],
-    },
-    {
-      label: "a competing record cannot be parsed",
-      metadata: item("Claude Code-credentials-1234abcd").replace(
-        '    "acct"<blob>="fixture-user"\n',
-        "",
-      ),
-      paths: [keychain],
-    },
-    {
-      label: "an unfamiliar Claude service remains",
-      metadata: item("Claude Code-credentials-unfamiliar"),
-      paths: [keychain],
-    },
-    {
-      label: "a Claude item belongs to another account",
-      metadata: item(service, undefined, "other-fixture-user"),
-      paths: [keychain],
-    },
-  ])(
-    "withholds a lone opaque item when $label",
-    async ({ metadata, paths }) => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-      const opaqueService = "Claude Code-credentials-abcdef12";
-      // The opaque value is readable, so accepting it would produce a fresh
-      // reading instead of exercising the exact-selector fallback below.
-      mockItems(item(opaqueService) + metadata, opaqueService, paths);
-      const { readCachedProvider, writeCachedProviders } =
-        await import("../../src/cache.js");
-      writeCachedProviders([cachedClaude()]);
-      const { fetchQuota } = await import("../../src/providers/claude.js");
-      const report = await fetchQuota(options);
-
-      expect(report.state).toMatchObject({
-        status: "stale",
-        error: "keychain_unreachable",
-      });
-      expect(readCachedProvider("claude")).toBeDefined();
-      expect(valueReadArgs()).toEqual([
-        "find-generic-password",
-        "-a",
-        "fixture-user",
-        "-w",
-        "-s",
-        service,
-      ]);
-      expect(fetch).not.toHaveBeenCalled();
-    },
-  );
-
-  it("reports missing for unrelated services and non-password items", async () => {
-    mockItems(
-      item("other-service", undefined, "other-user") +
-        item("unrelated-credentials-ABCDEF12", undefined, "other-user") +
-        item("other-service") +
-        item(service, undefined, undefined, undefined, "inet"),
-    );
-    const { inspectAuth } = await import("../../src/providers/claude.js");
-    const auth = await inspectAuth(options);
-    expect(auth.sources).toContainEqual({
-      source: "keychain",
-      status: "missing",
-    });
-    expect(execFileText.mock.calls).toEqual([
-      ["security", ["list-keychains"], 5000],
-      ["security", ["dump-keychain", keychain], 5000],
-    ]);
-  });
-
-  it.each([
-    ["an unfamiliar suffix length", "Claude Code-credentials-0123456789abcdef"],
-    ["an uppercase suffix", "Claude Code-credentials-ABCDEF12"],
-    ["a trailing segment", "Claude Code-credentials-deadbeef-extra"],
-  ])(
-    "never reports sign-out when this account holds a Claude item with %s",
-    async (_label, unfamiliar) => {
-      vi.useFakeTimers();
-      vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-      mockItems(item(unfamiliar), "unavailable-service");
-      const { readCachedProvider, writeCachedProviders } =
-        await import("../../src/cache.js");
-      writeCachedProviders([cachedClaude()]);
-      const { fetchQuota } = await import("../../src/providers/claude.js");
-      const report = await fetchQuota(options);
-
-      expect(report.state.status).toBe("stale");
-      expect(report.source).toBe("cache");
-      expect(readCachedProvider("claude")).toBeDefined();
-      expect(valueReadArgs()).toContain("Claude Code-credentials");
-      expect(valueReadArgs()).not.toContain(unfamiliar);
-    },
-  );
-
-  it("still prefers a recognized item over an unfamiliar one for the same account", async () => {
-    mockItems(
-      item("Claude Code-credentials-0123456789abcdef", "20260913020000Z") +
-        item(),
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(service);
-  });
-
   it.each([false, true])(
-    "does not read absence from a listing that printed nothing (prompt=%s)",
+    "keeps an ambiguous exit 44 as unreachable without asserting absence (prompt=%s)",
     async (allowKeychainPrompt) => {
-      mockItems("", "unavailable-service");
-      const { inspectAuth } = await import("../../src/providers/claude.js");
-      const auth = await inspectAuth({ ...options, allowKeychainPrompt });
-      expect(auth.sources).not.toContainEqual(
-        expect.objectContaining({ source: "keychain", status: "missing" }),
-      );
-      expect(
-        execFileText.mock.calls.some(([, args]) =>
-          args.includes("Claude Code-credentials"),
-        ),
-      ).toBe(true);
-    },
-  );
-
-  it.each([false, true])(
-    "enumerates explicit profiles without crossing to another service (prompt=%s)",
-    async (allowKeychainPrompt) => {
-      const configDir = join(home, "managed");
-      const selectedService = profileService(configDir);
-      vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
-      mockItems(item(), "unavailable-service");
+      execFileText.mockRejectedValue(unreachable());
       const { inspectAuth } = await import("../../src/providers/claude.js");
       const auth = await inspectAuth({ ...options, allowKeychainPrompt });
       expect(auth.sources).toContainEqual(
@@ -490,119 +272,28 @@ describe("Claude macOS Keychain discovery", () => {
           error: "keychain_unreachable",
         }),
       );
-      expect(execFileText.mock.calls.slice(0, 2)).toEqual([
-        ["security", ["list-keychains"], 5000],
-        ["security", ["dump-keychain", keychain], 5000],
-      ]);
-      expect(execFileText.mock.calls[2]?.[1]).toContain(selectedService);
-      expect(execFileText.mock.calls[2]?.[1]).not.toContain(service);
+      expect(auth.sources).not.toContainEqual(
+        expect.objectContaining({ source: "keychain", status: "missing" }),
+      );
+      expect(execFileText).toHaveBeenCalledTimes(1);
     },
   );
-
-  it("reads only the exact explicit-profile item even if the default is newer", async () => {
-    const configDir = join(home, "managed");
-    const selectedService = profileService(configDir);
-    vi.stubEnv("CLAUDE_CONFIG_DIR", configDir);
-    mockItems(
-      item(selectedService, "20260101000000Z") + item(),
-      selectedService,
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(selectedService);
-    expect(valueReadArgs()).not.toContain(service);
-  });
-
-  it("keeps an ambiguous exit 44 as unreachable without asserting absence", async () => {
-    execFileText.mockRejectedValue(
-      Object.assign(new Error("unreachable"), { code: 44 }),
-    );
-    const { inspectAuth } = await import("../../src/providers/claude.js");
-    const auth = await inspectAuth(options);
-    expect(auth.sources).toContainEqual(
-      expect.objectContaining({
-        source: "keychain",
-        status: "skipped",
-        error: "keychain_unreachable",
-      }),
-    );
-  });
-
-  it.each([false, true])(
-    "uses search-list order for duplicate services regardless of dump order (reverse=%s)",
-    async (reverse) => {
-      const records = [
-        item(service, "20260101000000Z", undefined, keychain),
-        item(service, "20260913020000Z", undefined, otherKeychain),
-      ];
-      mockItems((reverse ? records.reverse() : records).join(""), service, [
-        keychain,
-        otherKeychain,
-      ]);
-      const { fetchQuota } = await import("../../src/providers/claude.js");
-      expect((await fetchQuota(options)).state.status).toBe("fresh");
-      expect(valueReadArgs().at(-1)).toBe(keychain);
-    },
-  );
-
-  it("handles hex metadata and ignores unrelated numeric item classes", async () => {
-    const hex = (value: string) => `0x${Buffer.from(value).toString("hex")}`;
-    const metadata = item()
-      .replace(`"${service}"`, hex(service))
-      .replace('"fixture-user"', hex("fixture-user"))
-      .replace(`"${keychain}"`, hex(keychain));
-    mockItems(
-      metadata +
-        item("unrelated").replace('class: "genp"', "class: 0x80001000"),
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(keychain);
-  });
-
-  it("still reads a located item alongside an unreadable unrelated record", async () => {
-    mockItems(
-      item() + 'keychain: "/fixture/incomplete.keychain-db"\nversion: 512\n',
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    expect(valueReadArgs()).toContain(service);
-  });
-
-  it("does not turn a wholly unreadable listing into absence", async () => {
-    mockItems(
-      'keychain: "/fixture/incomplete.keychain-db"\nversion: 512\n',
-      "unavailable-service",
-    );
-    const { inspectAuth } = await import("../../src/providers/claude.js");
-    const auth = await inspectAuth(options);
-    expect(auth.sources).toContainEqual(
-      expect.objectContaining({
-        source: "keychain",
-        status: "skipped",
-        error: "keychain_unreachable",
-      }),
-    );
-    expect(valueReadArgs()).toContain("Claude Code-credentials");
-  });
 
   it.each([
     ["denied", { code: 51 }, "keychain_access_denied"],
     ["timeout", { killed: true, signal: "SIGTERM" }, "keychain_prompt_timeout"],
+    [
+      "abandoned",
+      { abandoned: true, code: "ETIMEDOUT" },
+      "keychain_prompt_timeout",
+    ],
     ["unreachable", { code: 44 }, "keychain_unreachable"],
   ])(
     "does not cross profiles after a %s value read",
     async (_label, failure, error) => {
-      execFileText.mockImplementation(async (_command: string, args) => {
-        if (args[0] === "list-keychains") return `    "${keychain}"\n`;
-        if (args[0] === "dump-keychain")
-          return (
-            item() +
-            item(profileService("/fixture/other-profile"), "20260914000000Z")
-          );
-        throw Object.assign(new Error("read failed"), failure);
-      });
+      execFileText.mockRejectedValue(
+        Object.assign(new Error("read failed"), failure),
+      );
       const { inspectAuth } = await import("../../src/providers/claude.js");
       expect((await inspectAuth(options)).sources).toContainEqual({
         source: "keychain",
@@ -610,91 +301,50 @@ describe("Claude macOS Keychain discovery", () => {
         error,
         credentialPresent: true,
       });
-      expect(
-        execFileText.mock.calls.filter(([, args]) => args.includes("-w")),
-      ).toHaveLength(1);
+      expect(execFileText).toHaveBeenCalledTimes(1);
+      expect(valueReadArgs()).toContain(service);
     },
   );
 
-  it("reports a selected item that cannot be read as unreachable, not absent", async () => {
-    mockItems(item(), "unavailable-service");
+  it("reports a presence lookup that outlived its wait as unchecked, not absent", async () => {
+    execFileText.mockRejectedValue(
+      Object.assign(new Error("left running"), {
+        abandoned: true,
+        code: "ETIMEDOUT",
+      }),
+    );
     const { inspectAuth } = await import("../../src/providers/claude.js");
-    expect((await inspectAuth(options)).sources).toContainEqual({
+    const auth = await inspectAuth({ ...options, allowKeychainPrompt: false });
+    expect(auth.sources).toContainEqual({
       source: "keychain",
       status: "skipped",
-      error: "keychain_unreachable",
-      credentialPresent: true,
+      error: "keychain_presence_check_failed",
     });
-    expect(execFileText).toHaveBeenCalledTimes(3);
+    expect(execFileText.mock.calls).toEqual([
+      [
+        "security",
+        ["find-generic-password", "-a", "fixture-user", "-s", service],
+        5000,
+        keychainCall,
+      ],
+    ]);
   });
 
   it("detects a sign-in on a later read in the same process", async () => {
     let signedIn = false;
-    execFileText.mockImplementation(async (_command: string, args) => {
-      if (args[0] === "list-keychains") return `    "${keychain}"\n`;
-      if (args[0] === "dump-keychain")
-        return signedIn ? item() : item("other-service");
+    execFileText.mockImplementation(async () => {
+      if (!signedIn) throw unreachable();
       return JSON.stringify({
         claudeAiOauth: { accessToken: "synthetic-token" },
       });
     });
     const { fetchQuota } = await import("../../src/providers/claude.js");
 
-    expect((await fetchQuota(options)).state.status).toBe("auth_required");
+    expect((await fetchQuota(options)).state.error).toBe(
+      "keychain_unreachable",
+    );
     signedIn = true;
     expect((await fetchQuota(options)).state.status).toBe("fresh");
-  });
-
-  it("recovers when a selected item is replaced in another keychain during repeated refreshes", async () => {
-    const selectedService = profileService("/fixture/tui-profile");
-    vi.stubEnv("CLAUDE_SECURESTORAGE_CONFIG_DIR", "/fixture/tui-profile");
-    let activeKeychain = keychain;
-    execFileText.mockImplementation(async (command: string, args: string[]) => {
-      expect(command).toBe("security");
-      if (args[0] === "list-keychains")
-        return `"${keychain}"\n"${otherKeychain}"\n`;
-      if (args[0] === "dump-keychain") {
-        expect(args).toEqual(["dump-keychain", keychain, otherKeychain]);
-        return [keychain, otherKeychain]
-          .map((path) =>
-            item(
-              path === activeKeychain ? selectedService : "other-service",
-              undefined,
-              undefined,
-              path,
-            ),
-          )
-          .join("");
-      }
-      expect(args.slice(0, 3)).toEqual([
-        "find-generic-password",
-        "-a",
-        "fixture-user",
-      ]);
-      if (!args.includes(selectedService) || args.at(-1) !== activeKeychain)
-        throw unreachable();
-      return JSON.stringify({
-        claudeAiOauth: { accessToken: "synthetic-token" },
-      });
-    });
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    expect((await fetchQuota(options)).state.status).toBe("fresh");
-    activeKeychain = otherKeychain;
-    expect(
-      (await fetchQuota({ ...options, allowKeychainPrompt: false })).state
-        .status,
-    ).toBe("fresh");
-
-    const reads = execFileText.mock.calls.filter(([, args]) =>
-      args.includes("-w"),
-    );
-    expect(reads.map(([, args]) => args.at(-1))).toEqual([
-      keychain,
-      otherKeychain,
-    ]);
-    expect(
-      execFileText.mock.calls.filter(([, args]) => args[0] === "dump-keychain"),
-    ).toHaveLength(2);
   });
 
   it("reselects a changed secure-storage profile without transferring its prompt grant", async () => {
@@ -703,12 +353,12 @@ describe("Claude macOS Keychain discovery", () => {
     const firstService = profileService(firstProfile);
     const nextService = profileService(nextProfile);
     vi.stubEnv("CLAUDE_SECURESTORAGE_CONFIG_DIR", firstProfile);
-    mockItems(item(firstService), firstService);
+    mockItems(firstService);
     const { fetchQuota } = await import("../../src/providers/claude.js");
     expect((await fetchQuota(options)).state.status).toBe("fresh");
 
     vi.stubEnv("CLAUDE_SECURESTORAGE_CONFIG_DIR", nextProfile);
-    mockItems(item(nextService), nextService);
+    mockItems(nextService);
     const withheld = await fetchQuota({
       ...options,
       allowKeychainPrompt: false,
@@ -737,97 +387,10 @@ describe("Claude macOS Keychain discovery", () => {
       nextService,
     ]);
   });
-
-  it("does not follow metadata naming a keychain outside the search list", async () => {
-    mockItems(
-      item(service, undefined, undefined, otherKeychain),
-      "unavailable-service",
-    );
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-    expect(report.state.status).not.toBe("auth_required");
-    expect(valueReadArgs()).not.toContain(otherKeychain);
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it("preserves cached quota when a partial search-list dump fails", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-    execFileText.mockImplementation(async (command: string, args: string[]) => {
-      expect(command).toBe("security");
-      if (args[0] === "list-keychains")
-        return `"${keychain}"\n"${otherKeychain}"\n`;
-      if (args[0] === "dump-keychain") {
-        expect(args).toEqual(["dump-keychain", keychain, otherKeychain]);
-        throw Object.assign(new Error("synthetic partial listing failure"), {
-          code: 44,
-          stdout: item("unrelated-service"),
-        });
-      }
-      expect(args.slice(0, 3)).toEqual([
-        "find-generic-password",
-        "-a",
-        "fixture-user",
-      ]);
-      expect(args).toContain(service);
-      expect(args).not.toContain(keychain);
-      expect(args).not.toContain(otherKeychain);
-      throw unreachable();
-    });
-    const { readCachedProvider, writeCachedProviders } =
-      await import("../../src/cache.js");
-    writeCachedProviders([cachedClaude()]);
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state).toMatchObject({
-      status: "stale",
-      error: "keychain_unreachable",
-    });
-    expect(readCachedProvider("claude")).toBeDefined();
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
-  it("does not infer missing from a successful dump that omits a searchable keychain", async () => {
-    mockItems(item("unrelated-service"), "unavailable-service", [
-      keychain,
-      otherKeychain,
-    ]);
-    const { inspectAuth } = await import("../../src/providers/claude.js");
-    const auth = await inspectAuth(options);
-    expect(auth.sources).not.toContainEqual({
-      source: "keychain",
-      status: "missing",
-    });
-  });
-
-  it("does not infer missing from a Claude item owned by another account", async () => {
-    vi.useFakeTimers();
-    vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-    mockItems(
-      item(service, undefined, "other-fixture-user"),
-      "unavailable-service",
-    );
-    const { readCachedProvider, writeCachedProviders } =
-      await import("../../src/cache.js");
-    writeCachedProviders([cachedClaude()]);
-    const { fetchQuota } = await import("../../src/providers/claude.js");
-    const report = await fetchQuota(options);
-
-    expect(report.state).toMatchObject({
-      status: "stale",
-      error: "keychain_unreachable",
-    });
-    expect(readCachedProvider("claude")).toBeDefined();
-    expect(valueReadArgs()).toContain("fixture-user");
-    expect(valueReadArgs()).not.toContain("other-fixture-user");
-    expect(fetch).not.toHaveBeenCalled();
-  });
-
   it("withholds a snapshot from the former opaque-discovery context without deleting it", async () => {
     vi.useFakeTimers();
     vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
-    mockItems(item("Claude Code-credentials-abcdef12"), "unavailable-service");
+    mockItems("unavailable-service");
     const { cacheFilePath } = await import("../../src/lib/fs.js");
     const file = cacheFilePath();
     mkdirSync(dirname(file), { recursive: true });
@@ -871,7 +434,7 @@ describe("Claude macOS Keychain discovery", () => {
         },
       }),
     );
-    mockItems(item());
+    mockItems();
     vi.stubGlobal(
       "fetch",
       vi.fn(async () => new Response(null, { status: 401 })),
@@ -929,12 +492,17 @@ describe("Claude macOS Keychain discovery", () => {
     ["unreachable", { code: 44 }, "keychain_unreachable"],
     ["timeout", { killed: true, signal: "SIGTERM" }, "keychain_prompt_timeout"],
     [
+      "abandoned",
+      { abandoned: true, code: "ETIMEDOUT" },
+      "keychain_prompt_timeout",
+    ],
+    [
       "buffer limit",
       { code: "ERR_CHILD_PROCESS_STDIO_MAXBUFFER" },
       "keychain_access_denied",
     ],
   ])(
-    "preserves cached quota after %s discovery and a leftover file's 401",
+    "preserves cached quota after a %s Keychain read and a leftover file's 401",
     async (_label, failure, error) => {
       vi.useFakeTimers();
       vi.setSystemTime(new Date("2026-09-13T01:00:00Z"));
