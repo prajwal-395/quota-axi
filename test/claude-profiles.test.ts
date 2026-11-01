@@ -22,7 +22,6 @@ import type { ProviderQuota } from "../src/types.js";
 let home: string;
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const now = "2026-09-15T10:00:00.000Z";
-const KEYCHAIN = "/fixture/login.keychain-db";
 
 type Identity = { account: string; organization?: string };
 
@@ -178,14 +177,7 @@ function mockMacKeychain(services: Map<string, string>) {
   });
   const exec = vi.fn(async (command: string, args: string[]) => {
     expect(command).toBe("security");
-    if (args[0] === "list-keychains") return `    "${KEYCHAIN}"\n`;
-    if (args[0] === "dump-keychain")
-      return [...services.keys()]
-        .map(
-          (service) =>
-            `keychain: "${KEYCHAIN}"\nclass: "genp"\nattributes:\n    "acct"<blob>="fixture-user"\n    "svce"<blob>="${service}"\n`,
-        )
-        .join("");
+    // Only the exact service/account lookup: never a whole-keychain dump.
     expect(args[0]).toBe("find-generic-password");
     expect(args).toContain("fixture-user");
     const service = args[args.indexOf("-s") + 1];
@@ -650,15 +642,63 @@ describe("Claude profile lane refresh and remedies", () => {
 
     const output = response(await command(["--json"]));
     expect(output.providers).toHaveLength(2);
+    // Exit 44 cannot prove the default's item absent, so it is not a sign-out.
     expect(output.providers.map((p) => p.state.status)).toEqual([
-      "auth_required",
+      "error",
       "fresh",
     ]);
-    expect(output.providers[0].state.error).toBe("credentials_missing");
+    expect(output.providers[0].state.error).toBe("keychain_unreachable");
     expect(bearers()).toEqual(["synthetic-work"]);
     expect(
-      exec.mock.calls.filter(([, args]) => args[0] === "dump-keychain"),
-    ).toHaveLength(1);
+      exec.mock.calls
+        .filter(([, args]) => args.includes("-w"))
+        .every(([, args]) => args.includes(workService)),
+    ).toBe(true);
+  });
+
+  it("costs each profile at most one exact Keychain call and never signals one", async () => {
+    const work = join(home, ".claude-work");
+    const other = join(home, ".claude-other");
+    mkdirSync(work);
+    mkdirSync(other);
+    const defaultService = await keychainService();
+    const workService = await keychainService(work);
+    const otherService = await keychainService(other);
+    const exec = mockMacKeychain(
+      new Map([
+        [defaultService, "synthetic-personal"],
+        [workService, "synthetic-work"],
+        [otherService, "synthetic-other"],
+      ]),
+    );
+    // The selected default and one listed profile hold a grant; the other
+    // listed profile does not, so it gets the value-free presence lookup.
+    await grant(defaultService);
+    await grant(workService);
+    optIn(work, other);
+
+    const output = response(await command(["--json"]));
+    expect(output.providers).toHaveLength(3);
+
+    const calls = exec.mock.calls.map(([, args]) => args);
+    expect(calls.every((args) => args[0] === "find-generic-password")).toBe(
+      true,
+    );
+    const perService = new Map<string, number>();
+    for (const args of calls) {
+      const service = args[args.indexOf("-s") + 1]!;
+      perService.set(service, (perService.get(service) ?? 0) + 1);
+    }
+    expect(Object.fromEntries(perService)).toEqual({
+      [defaultService]: 1,
+      [workService]: 1,
+      [otherService]: 1,
+    });
+    // A `security` child is never killed at its timeout: the read stops
+    // waiting and leaves it to finish, so securityd never sees a client torn
+    // down mid-request.
+    for (const call of exec.mock.calls as unknown[][])
+      expect(call[3]).toEqual({ abandonOnTimeout: true });
   });
 });
 

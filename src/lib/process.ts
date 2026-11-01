@@ -6,7 +6,27 @@ import * as path from "node:path";
 export type ExecFileTextOptions = {
   maxBufferBytes?: number;
   env?: NodeJS.ProcessEnv;
+  /**
+   * Stop waiting at the timeout without signalling the child. The promise
+   * rejects with an {@link AbandonedCommandError} and the child runs to
+   * completion on its own, detached from this process's event loop. Use it
+   * for a client whose teardown mid-request is itself harmful, such as
+   * macOS `security`: killing it while securityd is serving the request
+   * races securityd's client teardown.
+   */
+  abandonOnTimeout?: boolean;
 };
+
+/** The child outlived the wait and was left running, never signalled. */
+export class AbandonedCommandError extends Error {
+  readonly abandoned = true;
+  readonly code = "ETIMEDOUT";
+
+  constructor(command: string, timeoutMs: number) {
+    super(`${command} did not finish within ${timeoutMs}ms; left running`);
+    this.name = "AbandonedCommandError";
+  }
+}
 
 export function execFileText(
   command: string,
@@ -26,11 +46,15 @@ export function execFileText(
       reject(error);
       return;
     }
-    execFile(
+    let settled = false;
+    let abandonTimer: NodeJS.Timeout | undefined;
+    const child = execFile(
       invocation.command,
       invocation.args,
       {
-        timeout: timeoutMs,
+        // Node's own timeout sends killSignal (SIGTERM), so an abandoning
+        // caller keeps its own timer instead.
+        ...(options.abandonOnTimeout ? {} : { timeout: timeoutMs }),
         // A busy multi-agent host's full `ps` table with command lines runs
         // well past 1 MiB, which surfaced as an unexplained probe failure.
         maxBuffer: options.maxBufferBytes ?? 16 * 1024 * 1024,
@@ -41,6 +65,9 @@ export function execFileText(
             : {}),
       },
       (error, stdout) => {
+        clearTimeout(abandonTimer);
+        if (settled) return;
+        settled = true;
         if (error) {
           reject(error);
           return;
@@ -48,6 +75,17 @@ export function execFileText(
         resolve(String(stdout));
       },
     );
+    if (options.abandonOnTimeout)
+      abandonTimer = setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        // Keep draining its output so it never blocks on a full pipe, but
+        // let this process exit without waiting for it.
+        child.unref();
+        for (const stream of [child.stdin, child.stdout, child.stderr])
+          (stream as { unref?: () => void } | null)?.unref?.();
+        reject(new AbandonedCommandError(command, timeoutMs));
+      }, timeoutMs);
   });
 }
 

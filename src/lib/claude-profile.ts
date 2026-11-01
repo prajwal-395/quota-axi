@@ -33,7 +33,6 @@ export function claudeProfileLocations(env: NodeJS.ProcessEnv = process.env): {
   configDir: string;
   secureStorageSelected: boolean;
   keychainService: string;
-  acceptsOpaqueDefaultItem: boolean;
 } {
   const configured = env.CLAUDE_CONFIG_DIR;
   const storage = env.CLAUDE_SECURESTORAGE_CONFIG_DIR;
@@ -49,10 +48,6 @@ export function claudeProfileLocations(env: NodeJS.ProcessEnv = process.env): {
     keychainService: selector
       ? suffixedKeychainService(selector)
       : CLAUDE_KEYCHAIN_SERVICE,
-    // A default selection cannot re-derive the suffix Claude Code gave its own
-    // item, so a suffixed item may still be this profile's. An explicit
-    // selector names one exact item and must never fall through to another.
-    acceptsOpaqueDefaultItem: selector === undefined,
   };
 }
 
@@ -86,14 +81,6 @@ export function claudeListedProfiles(
   }
   // Delimiters alone name nothing to opt in to.
   return dirs.length || invalid.length ? { dirs, invalid } : undefined;
-}
-
-/** The `Claude Code-credentials-<8 lowercase hex>` shape the vendor writes. */
-export function isOpaqueSuffixedKeychainService(service: string): boolean {
-  return (
-    service.startsWith(`${CLAUDE_KEYCHAIN_SERVICE}-`) &&
-    /^[0-9a-f]{8}$/.test(service.slice(CLAUDE_KEYCHAIN_SERVICE.length + 1))
-  );
 }
 
 function suffixedKeychainService(selector: string): string {

@@ -25,16 +25,11 @@ export type ClaudeProfileLane = {
  * the user named them; one without a credential reports that as its own
  * reading. The default profile was not named, so it joins only on positive
  * evidence that it holds a credential: its native credential file, or (on
- * macOS) its exact Keychain item, checked from metadata without reading a
- * value. `hasKeychainItem` receives the Keychain services the other lanes own
- * so a sibling's item is never taken for the default's.
+ * macOS) its exact Keychain item, checked without reading a value.
  */
 export async function discoverClaudeProfiles(
   listed: readonly string[],
-  hasKeychainItem: (
-    profile: ClaudeProfile,
-    siblingServices: ReadonlySet<string>,
-  ) => Promise<boolean>,
+  hasKeychainItem: (profile: ClaudeProfile) => Promise<boolean>,
 ): Promise<ClaudeProfileLane[]> {
   const candidates: (ClaudeProfileLane & { implicit: boolean })[] = [
     { profile: claudeProfileLocations(), selected: true, implicit: false },
@@ -56,31 +51,20 @@ export async function discoverClaudeProfiles(
   const unique = [...byStore.values()];
   const lanes: ClaudeProfileLane[] = [];
   for (const candidate of unique) {
-    if (candidate.implicit) {
-      const siblingServices = new Set(
-        unique
-          .filter((other) => other !== candidate)
-          .map((other) => other.profile.keychainService)
-          .filter((service) => service !== candidate.profile.keychainService),
-      );
-      if (!(await holdsCredential(candidate.profile, siblingServices)))
-        continue;
-    }
+    if (candidate.implicit && !(await holdsCredential(candidate.profile)))
+      continue;
     lanes.push({ profile: candidate.profile, selected: candidate.selected });
   }
   return lanes;
 
-  async function holdsCredential(
-    profile: ClaudeProfile,
-    siblingServices: ReadonlySet<string>,
-  ): Promise<boolean> {
+  async function holdsCredential(profile: ClaudeProfile): Promise<boolean> {
     const darwin = process.platform === "darwin";
     if (
       !(profile.secureStorageSelected && darwin) &&
       credentialFilePresent(join(profile.configDir, ".credentials.json"))
     )
       return true;
-    return darwin && (await hasKeychainItem(profile, siblingServices));
+    return darwin && (await hasKeychainItem(profile));
   }
 }
 

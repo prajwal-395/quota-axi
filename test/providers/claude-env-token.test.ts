@@ -20,47 +20,26 @@ const STORED_TOKEN = "synthetic-stored-token";
 const OAUTH_FILE_TOKEN = "synthetic-oauth-file-token";
 const platform = Object.getOwnPropertyDescriptor(process, "platform")!;
 const options = { allowKeychainPrompt: true, refreshCredentials: false };
-const service = "Claude Code-credentials";
-const keychain = "/fixture/Library/Keychains/login.keychain-db";
 let home: string;
 let fetchMock: ReturnType<typeof vi.fn>;
 
-function item(modified = "20260913010000Z", name = service): string {
-  const date = Buffer.from(`${modified}\0`).toString("hex");
-  return `keychain: "${keychain}"
-version: 512
-class: "genp"
-attributes:
-    "acct"<blob>="fixture-user"
-    "mdat"<timedate>=0x${date}  "${modified}\\000"
-    "svce"<blob>="${name}"
-`;
-}
-
 /**
- * Serve a synthetic Keychain credential, or a search list that conclusively
- * holds no Claude item. Conclusive absence matters: an unreadable Keychain is a
- * different state, covered separately below.
+ * Serve a synthetic Keychain credential, or a store whose exact lookup exits
+ * 44. Exit 44 cannot tell an absent item from an unreachable store, so either
+ * way no stored-session sign-out follows from it.
  */
 function mockStore(stored?: { accessToken: string; expiresAt?: number }): void {
   execFileText.mockImplementation(async (command: string, args: string[]) => {
     expect(command).toBe("security");
-    if (args[0] === "list-keychains") return `    "${keychain}"\n`;
-    if (args[0] === "dump-keychain")
-      return stored ? item() : item("20260913010000Z", "Some-Other-Service");
+    expect(args[0]).toBe("find-generic-password");
     if (!stored) throw Object.assign(new Error("absent"), { code: 44 });
     return args.includes("-w") ? JSON.stringify({ claudeAiOauth: stored }) : "";
   });
 }
 
-/** A search list quota-axi cannot read at all. */
+/** A Keychain quota-axi cannot read at all. */
 function mockUnreadableStore(): void {
-  execFileText.mockImplementation(async (command: string, args: string[]) => {
-    expect(command).toBe("security");
-    if (args[0] === "list-keychains") return `    "${keychain}"\n`;
-    if (args[0] === "dump-keychain") return "";
-    throw Object.assign(new Error("unreachable"), { code: 44 });
-  });
+  mockStore();
 }
 
 /**
